@@ -150,7 +150,16 @@ fn ensure_vendor(vendor: &Path) -> Result<(), String> {
 }
 
 fn sha256_file(p: &Path) -> Result<String, String> {
-    let data = fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+    let data = fs::read(p).map_err(|e| {
+        // ERROR_VIRUS_INFECTED: Defender flags WinDivert as a "HackTool" (it is a packet driver)
+        let hint = if e.raw_os_error() == Some(225) {
+            " -- Microsoft Defender blocked WinDivert; add an exclusion for this project folder \
+             (Add-MpPreference -ExclusionPath <folder>, elevated PowerShell) and rebuild"
+        } else {
+            ""
+        };
+        format!("read {}: {e}{hint}", p.display())
+    })?;
     Ok(hex(&Sha256::digest(&data)))
 }
 
