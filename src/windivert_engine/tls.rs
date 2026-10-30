@@ -60,6 +60,29 @@ fn push_ext(out: &mut Vec<u8>, ty: u16, data: &[u8]) {
 
 /// Plausible TLS 1.3 ClientHello carrying `sni`; used as the decoy payload for fakes.
 pub fn build_fake_client_hello(sni: &str) -> Vec<u8> {
+    build_client_hello(sni, 0)
+}
+
+/// Same, grown to exactly `len` bytes with a padding extension (RFC 7685) when `len` is larger
+/// than the bare hello.
+pub fn build_fake_client_hello_len(sni: &str, len: usize) -> Vec<u8> {
+    let bare = build_client_hello(sni, 0).len();
+    if len < bare + 4 {
+        return build_client_hello(sni, 0);
+    }
+    build_client_hello(sni, len - bare)
+}
+
+/// Bytes placed in front of the real data by the "seqovl" split: whole fake ClientHellos of
+/// `unit` bytes for `sni`, repeated and cut to `ovl` bytes. The DPI parses them as the start of
+/// the stream; the server discards them as already-received sequence space.
+pub fn seqovl_pattern(sni: &str, unit: usize, ovl: usize) -> Vec<u8> {
+    let hello = build_fake_client_hello_len(sni, unit);
+    hello.iter().copied().cycle().take(ovl).collect()
+}
+
+/// `pad_total`: bytes the padding extension occupies including its 4-byte header (0 = none).
+fn build_client_hello(sni: &str, pad_total: usize) -> Vec<u8> {
     let name = sni.as_bytes();
     let mut sn = Vec::new();
     sn.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
@@ -75,6 +98,9 @@ pub fn build_fake_client_hello(sni: &str) -> Vec<u8> {
     let mut ks = vec![0, 36, 0, 0x1d, 0, 32];
     ks.extend((0..32).map(|_| fastrand::u8(..)));
     push_ext(&mut ext, 0x0033, &ks);
+    if pad_total >= 4 {
+        push_ext(&mut ext, 0x0015, &vec![0u8; pad_total - 4]);
+    }
 
     let mut body = vec![3, 3];
     body.extend((0..32).map(|_| fastrand::u8(..)));
@@ -93,4 +119,25 @@ pub fn build_fake_client_hello(sni: &str) -> Vec<u8> {
     rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
     rec.extend_from_slice(&hs);
     rec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fake_hello_parses_and_pads() {
+        let h = build_fake_client_hello("4pda.to");
+        assert_eq!(parse_client_hello(&h).unwrap().sni, "4pda.to");
+        for len in [284usize, 681] {
+            let p = build_fake_client_hello_len("www.google.com", len);
+            assert_eq!(p.len(), len);
+            assert_eq!(parse_client_hello(&p).unwrap().sni, "www.google.com");
+            assert_eq!(u16::from_be_bytes([p[3], p[4]]) as usize, len - 5);
+        }
+        let pat = seqovl_pattern("4pda.to", 284, 568);
+        assert_eq!(pat.len(), 568);
+        assert_eq!(pat[..5], pat[284..289]);
+        assert_eq!(parse_client_hello(&pat[284..]).unwrap().sni, "4pda.to");
+    }
 }

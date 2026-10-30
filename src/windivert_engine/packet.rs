@@ -93,6 +93,10 @@ pub fn http_host(payload: &[u8]) -> Option<(usize, String)> {
     Some((i, host))
 }
 
+/// Ports carrying TLS we desync: HTTPS plus the Cloudflare alternate ports Discord's voice
+/// servers (*.discord.media) use for their WebSocket signalling.
+pub const TLS_PORTS: [u16; 6] = [443, 2053, 2083, 2087, 2096, 8443];
+
 /// UDP port ranges of Discord voice (RTC) servers.
 pub const DISCORD_VOICE_PORTS: [(u16, u16); 2] = [(19294, 19344), (50000, 50100)];
 
@@ -159,9 +163,10 @@ pub fn filter() -> String {
         .map(|(lo, hi)| format!("(udp.DstPort >= {lo} and udp.DstPort <= {hi})"))
         .collect::<Vec<_>>()
         .join(" or ");
+    let tls = TLS_PORTS.iter().map(|p| format!("tcp.DstPort == {p}")).collect::<Vec<_>>().join(" or ");
     format!(
         "outbound and !loopback and ip and (\
- (tcp.DstPort == 443 and tcp.PayloadLength > 5 and tcp.Payload[0] == 22 and tcp.Payload[5] == 1) or \
+ (({tls}) and tcp.PayloadLength > 5 and tcp.Payload[0] == 22 and tcp.Payload[5] == 1) or \
  (tcp.DstPort == 80 and tcp.PayloadLength > 0 and tcp.Payload[0] >= 65 and tcp.Payload[0] <= 90) or \
  (udp.DstPort == 443 and udp.PayloadLength >= 1200) or \
  (udp.PayloadLength > 0 and ({voice})))"
@@ -208,6 +213,7 @@ mod tests {
         let (i, h) = http_host(b"GET / HTTP/1.1\r\nHost: t.me:80\r\n\r\n").unwrap();
         assert_eq!((i, h.as_str()), (14, "t.me"));
         let f = filter();
+        assert!(f.contains("tcp.DstPort == 2053"));
         assert!(f.contains("(udp.DstPort >= 19294 and udp.DstPort <= 19344)"));
     }
 

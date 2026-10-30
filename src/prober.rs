@@ -11,7 +11,7 @@
 
 pub mod profile;
 
-use profile::{Profile, Shared, SplitAt};
+use profile::{Method, Profile, Shared, SplitAt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -88,16 +88,22 @@ fn failed_hosts(ok: &[bool]) -> String {
     HTTPS_TARGETS.iter().zip(ok).filter(|(_, ok)| !**ok).map(|(h, _)| *h).collect::<Vec<_>>().join(", ")
 }
 
-/// The current profile first, then [Split Offset x Fake TTL (3..12, plus "none") x BadSum],
-/// cheapest / most common first.
+/// The current profile first, then seqovl (zapret-discord-youtube's default), then
+/// [Split Offset x Fake TTL (3..12, plus "none") x BadSum], cheapest / most common first.
 fn candidates(base: &Profile) -> Vec<Profile> {
     let splits = [SplitAt::SniMid, SplitAt::SniStart(1), SplitAt::Fixed(1)];
     let ttls: [u8; 11] = [0, 6, 4, 8, 5, 7, 3, 9, 10, 11, 12];
     let mut out = vec![base.clone()];
+    if base.method != Method::SeqOvl {
+        let mut p = base.clone();
+        p.method = Method::SeqOvl;
+        out.push(p);
+    }
     for &ttl in &ttls {
         for &bad in &[false, true] {
             for &split in &splits {
                 let mut p = base.clone();
+                p.method = Method::FakeSplit;
                 p.split = split;
                 p.disorder = true;
                 p.fake_ttl = ttl;
@@ -135,7 +141,13 @@ async fn search(shared: &Shared, cfg: &Arc<ClientConfig>) -> bool {
     }
     match best {
         Some((ok, total, oks, p)) => {
-            info!("strategy: {ok}/{need} targets, {total:?} -> split={:?} ttl={} badsum={}", p.split, p.fake_ttl, p.bad_sum);
+            match p.method {
+                Method::SeqOvl => info!("strategy: {ok}/{need} targets, {total:?} -> seqovl"),
+                Method::FakeSplit => info!(
+                    "strategy: {ok}/{need} targets, {total:?} -> fake+split split={:?} ttl={} badsum={}",
+                    p.split, p.fake_ttl, p.bad_sum
+                ),
+            }
             if ok < need {
                 warn!("still unreachable with the best strategy: {}", failed_hosts(&oks));
             }

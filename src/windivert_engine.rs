@@ -1,8 +1,8 @@
 //! Engine A — WinDivert packet loop (network layer).
 //!
-//!  * TCP/443 TLS ClientHello with a target SNI  -> [fake(s)] + split + (disorder)
-//!  * TCP/80  HTTP request with a target Host     -> same, split inside "Host"
-//!  * UDP/443 QUIC Initial with a YouTube SNI     -> dropped (browser falls back to TCP/TLS)
+//!  * TLS ClientHello with a target SNI (443 and Discord's 2053/2083/2087/2096/8443),
+//!    HTTP/80 request with a target Host -> "seqovl" split (default) or fake + split + disorder
+//!  * UDP/443 QUIC Initial with a target SNI      -> dropped (app falls back to TCP/TLS)
 //!  * UDP to Discord voice ports (19294-19344, 50000-50100) -> N decoy datagrams before
 //!    each of the first 3 packets of a flow
 //!
@@ -23,7 +23,7 @@ mod imp {
     use super::ffi::{Address, Divert};
     use super::packet::{self, Tcp4};
     use super::{quic, tls};
-    use crate::prober::profile::{is_target, is_youtube, Profile, Shared};
+    use crate::prober::profile::{is_google, is_target, Method, Profile, Shared};
     use anyhow::Result;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -97,7 +97,7 @@ mod imp {
 
         fn on_tcp(&self, p: &Profile, pkt: &[u8], addr: &Address) -> Result<Action> {
             let Some(t) = Tcp4::parse(pkt) else { return Ok(Action::Pass) };
-            if t.ps < pkt.len() && (t.dport == 443 || t.dport == 80) {
+            if t.ps < pkt.len() && (t.dport == 80 || packet::TLS_PORTS.contains(&t.dport)) {
                 return self.desync(p, pkt, addr, &t);
             }
             Ok(Action::Pass)
@@ -107,21 +107,46 @@ mod imp {
             let (ihl, ps) = (t.ihl, t.ps);
             let payload = &pkt[ps..];
 
-            let (split, fake) = if t.dport == 443 {
+            if payload.len() < 2 {
+                return Ok(Action::Pass);
+            }
+            let (host, split, fake) = if t.dport != 80 {
                 let Some(h) = tls::parse_client_hello(payload) else { return Ok(Action::Pass) };
                 if !is_target(&h.sni) {
                     return Ok(Action::Pass);
                 }
-                tracing::debug!("TLS {} -> split", h.sni);
-                (p.split.resolve(h.sni_off, h.sni.len(), payload.len()), tls::build_fake_client_hello(&p.fake_sni))
+                let k = p.split.resolve(h.sni_off, h.sni.len(), payload.len());
+                (h.sni, k, tls::build_fake_client_hello(&p.fake_sni))
             } else {
                 let Some((i, host)) = packet::http_host(payload) else { return Ok(Action::Pass) };
-                if !is_target(&host) || payload.len() < 2 {
+                if !is_target(&host) {
                     return Ok(Action::Pass);
                 }
                 let k = (i + 4).clamp(1, payload.len() - 1); // "\r\nHo|st:"
-                (k, format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", p.fake_sni).into_bytes())
+                (host, k, format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", p.fake_sni).into_bytes())
             };
+
+            if p.method == Method::SeqOvl {
+                // [fake hello bytes | payload[0]] at seq-ovl, then payload[1..]: the DPI sees the
+                // fake SNI first, the server trims the bytes that precede its receive window.
+                let google = is_google(&host);
+                let (sni, unit, ovl) = if google { ("www.google.com", 681, 681) } else { ("4pda.to", 284, 568) };
+                let pattern = tls::seqovl_pattern(sni, unit, ovl);
+                let mut first = pattern;
+                first.push(payload[0]);
+                let mut s1 = packet::build_tcp(pkt, ihl, ps, 0u32.wrapping_sub(ovl as u32), &first, None);
+                let mut s2 = packet::build_tcp(pkt, ihl, ps, 1, &payload[1..], None);
+                if google {
+                    // ip-id=zero, as zapret does for Google
+                    s1[4..6].fill(0);
+                    s2[4..6].fill(0);
+                }
+                tracing::debug!("{} {host}:{} -> seqovl {ovl}", if t.dport == 80 { "HTTP" } else { "TLS" }, t.dport);
+                self.emit(addr, s1, ihl + 16, false)?;
+                self.emit(addr, s2, ihl + 16, false)?;
+                return Ok(Action::Consumed);
+            }
+            tracing::debug!("{} {host}:{} -> fake+split", if t.dport == 80 { "HTTP" } else { "TLS" }, t.dport);
 
             // 1) decoys: same 4-tuple + same seq as the real data, but never accepted by the server
             let ttl = (p.fake_ttl > 0).then_some(p.fake_ttl);
@@ -169,7 +194,7 @@ mod imp {
                     return Ok(Action::Pass);
                 }
                 return Ok(match quic::initial_sni(payload) {
-                    Some(s) if is_youtube(&s) => {
+                    Some(s) if is_target(&s) => {
                         tracing::debug!("QUIC {s} dropped -> TCP fallback");
                         Action::Consumed
                     }

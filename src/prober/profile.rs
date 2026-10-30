@@ -26,9 +26,19 @@ impl SplitAt {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    /// split at byte 1 and prepend a fake ClientHello in already-acknowledged sequence space
+    /// ("multisplit + seqovl" in zapret): needs no TTL guess, the server drops the fake bytes
+    SeqOvl,
+    /// TTL-limited / bad-checksum fake, then the real data split in two (optionally reversed)
+    FakeSplit,
+}
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     // ---- Engine A: TCP/TLS ----
+    pub method: Method,
     pub split: SplitAt,
     pub disorder: bool,
     /// 0 = no TTL-limited fake
@@ -44,6 +54,7 @@ pub struct Profile {
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            method: Method::SeqOvl,
             split: SplitAt::SniMid,
             disorder: true,
             fake_ttl: 6,
@@ -62,19 +73,36 @@ pub fn shared_default() -> Shared {
     Arc::new(ArcSwap::from_pointee(Profile::default()))
 }
 
+/// Hosts that get desync (suffix match). YouTube plus the Discord list used by
+/// zapret-discord-youtube.
 const TARGETS: &[&str] = &[
+    // YouTube / Google video
     "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "youtube-nocookie.com",
-    "discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media", "discordcdn.com",
-    "discordstatus.com", "dis.gd", "discord.co", "discord-attachments-uploads-prd.storage.googleapis.com",
+    "youtubekids.com", "youtube.googleapis.com", "youtubei.googleapis.com",
+    "youtubeembeddedplayer.googleapis.com", "jnn-pa.googleapis.com", "yt3.googleusercontent.com",
+    "wide-youtube.l.google.com", "youtube-ui.l.google.com", "yt-video-upload.l.google.com",
+    "ytimg.l.google.com", "play.google.com", "fonts.googleapis.com", "www.gstatic.com",
+    // Discord
+    "discord.com", "discord.gg", "discord.app", "discord.co", "discord.design", "discord.dev",
+    "discord.gift", "discord.gifts", "discord.media", "discord.new", "discord.store",
+    "discord.status", "discordapp.com", "discordapp.net", "discordcdn.com", "discordstatus.com",
+    "discord-activities.com", "discordactivities.com", "discordmerch.com", "discordpartygames.com",
+    "discordsays.com", "discordsez.com", "dis.gd", "discord-attachments-uploads-prd.storage.googleapis.com",
+    // Cloudflare front / ECH used by Discord
+    "cloudflare-ech.com", "encryptedsni.com",
 ];
-const YOUTUBE: &[&str] = &["youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "youtube-nocookie.com"];
+/// Google-hosted names: their fake pattern carries www.google.com (as zapret's list-google).
+const GOOGLE: &[&str] = &[
+    "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "youtube-nocookie.com",
+    "youtubekids.com", "googleapis.com", "googleusercontent.com", "google.com", "gstatic.com",
+];
 
 fn matches(host: &str, list: &[&str]) -> bool {
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     list.iter().any(|s| h == *s || (h.len() > s.len() && h.ends_with(s) && h.as_bytes()[h.len() - s.len() - 1] == b'.'))
 }
 pub fn is_target(host: &str) -> bool { matches(host, TARGETS) }
-pub fn is_youtube(host: &str) -> bool { matches(host, YOUTUBE) }
+pub fn is_google(host: &str) -> bool { matches(host, GOOGLE) }
 
 #[cfg(test)]
 mod tests {
@@ -88,7 +116,8 @@ mod tests {
         assert!(is_target("WWW.YouTube.com."));
         assert!(!is_target("notdiscord.com"));
         assert!(!is_target("web.telegram.org"));
-        assert!(is_youtube("i.ytimg.com") && !is_youtube("discord.com"));
+        assert!(is_target("c-abc123.discord.media") && is_target("cdn.discordapp.com"));
+        assert!(is_google("rr1---sn-x.googlevideo.com") && !is_google("discord.com"));
     }
 
     #[test]
