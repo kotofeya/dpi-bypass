@@ -1,18 +1,24 @@
 //! WebSocket dialer for Engine B: DNS (system -> Cloudflare DoH fallback), TCP, user-space
 //! ClientHello fragmentation (TCP split + TLS record split), optional no-SNI, then the WS upgrade.
+//!
+//! Every socket opened here is bound first and its local port registered in the NAT table's
+//! bypass set, so Engine A does not reflect our own gateway connections back into the bridge.
 
-use crate::profile::{Shared, SplitAt, WsMethod};
-use crate::tls;
+use crate::nat_table::{BypassGuard, NatTable};
+use crate::prober::profile::{Shared, SplitAt, WsMethod};
+use crate::windivert_engine::tls;
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::{sleep, timeout, Sleep};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
@@ -35,12 +41,34 @@ pub struct FragIo<S> {
     owed: usize,
     delay: Option<Pin<Box<Sleep>>>,
     started: bool,
+    _bypass: Option<BypassGuard>,
 }
 
 impl<S> FragIo<S> {
-    pub fn new(inner: S, plan: Option<Plan>) -> Self {
-        Self { inner, plan, chunks: VecDeque::new(), cur: Vec::new(), cur_off: 0, owed: 0, delay: None, started: false }
+    pub fn new(inner: S, plan: Option<Plan>, bypass: Option<BypassGuard>) -> Self {
+        Self {
+            inner,
+            plan,
+            chunks: VecDeque::new(),
+            cur: Vec::new(),
+            cur_off: 0,
+            owed: 0,
+            delay: None,
+            started: false,
+            _bypass: bypass,
+        }
     }
+}
+
+/// `connect()` from a pre-bound socket whose port is exempt from the transparent redirect.
+pub async fn connect_bypassed(nat: &Arc<NatTable>, addr: SocketAddr) -> io::Result<(TcpStream, BypassGuard)> {
+    let sock = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    let any: SocketAddr = if addr.is_ipv4() { ([0u8; 4], 0).into() } else { ([0u16; 8], 0).into() };
+    sock.bind(any)?;
+    let guard = nat.bypass(sock.local_addr()?.port());
+    let s = sock.connect(addr).await?;
+    s.set_nodelay(true)?;
+    Ok((s, guard))
 }
 
 fn plan_chunks(plan: &Plan, buf: &[u8]) -> Option<Vec<Vec<u8>>> {
@@ -128,6 +156,9 @@ pub type Ws = WebSocketStream<Tls>;
 
 pub struct WsDialer {
     profile: Shared,
+    nat: Arc<NatTable>,
+    /// cleared by the prober when Cloudflare DoH is unreachable (skips a 4 s timeout per dial)
+    pub doh_ok: AtomicBool,
     cfg_sni: Arc<ClientConfig>,
     cfg_nosni: Arc<ClientConfig>,
     cache: Mutex<HashMap<String, (Instant, Vec<IpAddr>)>>,
@@ -149,13 +180,28 @@ pub fn mk_cfg(enable_sni: bool) -> Arc<ClientConfig> {
 }
 
 impl WsDialer {
-    pub fn new(profile: Shared, overrides: Vec<IpAddr>) -> Self {
-        Self { profile, cfg_sni: mk_cfg(true), cfg_nosni: mk_cfg(false), cache: Mutex::new(HashMap::new()), overrides }
+    pub fn new(profile: Shared, nat: Arc<NatTable>, overrides: Vec<IpAddr>) -> Self {
+        Self {
+            profile,
+            nat,
+            doh_ok: AtomicBool::new(true),
+            cfg_sni: mk_cfg(true),
+            cfg_nosni: mk_cfg(false),
+            cache: Mutex::new(HashMap::new()),
+            overrides,
+        }
+    }
+
+    pub fn nat(&self) -> &Arc<NatTable> {
+        &self.nat
     }
 
     pub async fn connect(&self, host: &str) -> Result<Ws> {
         let mut last = anyhow!("no addresses for {host}");
         for doh in [false, true] {
+            if doh && !self.doh_ok.load(Ordering::Relaxed) && self.overrides.is_empty() {
+                continue;
+            }
             let ips = self.resolve(host, doh).await;
             for ip in ips.iter().take(4) {
                 match timeout(Duration::from_secs(6), self.connect_ip(host, *ip)).await {
@@ -170,8 +216,7 @@ impl WsDialer {
 
     async fn connect_ip(&self, host: &str, ip: IpAddr) -> Result<Ws> {
         let p = self.profile.load_full();
-        let tcp = TcpStream::connect((ip, 443)).await?;
-        tcp.set_nodelay(true)?;
+        let (tcp, guard) = connect_bypassed(&self.nat, SocketAddr::new(ip, 443)).await?;
         let plan = (p.ws_method == WsMethod::Fragment).then(|| Plan {
             split: p.ws_split,
             record_split: p.ws_record_split,
@@ -179,7 +224,7 @@ impl WsDialer {
         });
         let cfg = if p.ws_method == WsMethod::NoSni { &self.cfg_nosni } else { &self.cfg_sni };
         let tls = TlsConnector::from(cfg.clone())
-            .connect(ServerName::try_from(host.to_string())?, FragIo::new(tcp, plan))
+            .connect(ServerName::try_from(host.to_string())?, FragIo::new(tcp, plan, Some(guard)))
             .await?;
         let mut req = format!("wss://{host}/apiws").into_client_request()?;
         req.headers_mut().insert("Sec-WebSocket-Protocol", HeaderValue::from_static("binary"));
@@ -219,11 +264,11 @@ impl WsDialer {
     }
 
     /// DNS-over-HTTPS against Cloudflare's anycast 1.1.1.1 (IP-SAN certificate, no SNI sent).
-    async fn doh(&self, host: &str) -> Result<Vec<IpAddr>> {
+    pub async fn doh(&self, host: &str) -> Result<Vec<IpAddr>> {
         let run = async {
             let tcp = TcpStream::connect(("1.1.1.1", 443)).await?;
             let sn = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)).into());
-            let mut tls = TlsConnector::from(self.cfg_sni.clone()).connect(sn, FragIo::new(tcp, None)).await?;
+            let mut tls = TlsConnector::from(self.cfg_sni.clone()).connect(sn, FragIo::new(tcp, None, None)).await?;
             let req = format!(
                 "GET /dns-query?name={host}&type=A HTTP/1.0\r\nHost: cloudflare-dns.com\r\nAccept: application/dns-json\r\n\r\n"
             );

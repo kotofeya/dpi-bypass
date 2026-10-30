@@ -1,7 +1,7 @@
 //! Decrypts a client QUIC v1 Initial packet (RFC 9001 §5) just far enough to read the SNI,
 //! so Engine A can drop QUIC only for YouTube and leave everything else alone.
 
-use crate::tls;
+use super::tls;
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt};
 use aes::Aes128;
 use aes_gcm::{aead::{Aead, Payload}, Aes128Gcm, KeyInit};
