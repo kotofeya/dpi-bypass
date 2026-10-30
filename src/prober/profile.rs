@@ -8,8 +8,6 @@ use std::sync::Arc;
 pub enum SplitAt {
     /// absolute byte offset inside the TCP payload
     Fixed(usize),
-    /// SNI hostname start + delta
-    SniStart(usize),
     /// middle of the SNI hostname
     SniMid,
 }
@@ -19,7 +17,6 @@ impl SplitAt {
     pub fn resolve(self, sni_off: usize, sni_len: usize, len: usize) -> usize {
         let p = match self {
             SplitAt::Fixed(n) => n,
-            SplitAt::SniStart(d) => sni_off + d,
             SplitAt::SniMid => sni_off + sni_len / 2,
         };
         p.clamp(1, len.saturating_sub(1).max(1))
@@ -29,24 +26,35 @@ impl SplitAt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     /// split at byte 1 and prepend a fake ClientHello in already-acknowledged sequence space
-    /// ("multisplit + seqovl" in zapret): needs no TTL guess, the server drops the fake bytes
+    /// ("multisplit + seqovl" in zapret): needs no fooling, the server drops the fake bytes
     SeqOvl,
-    /// TTL-limited / bad-checksum fake, then the real data split in two (optionally reversed)
+    /// `fake_count` fakes, then the original data untouched (zapret "fake")
+    Fake,
+    /// fakes, then the real data split in two, optionally reversed (zapret "fake,multidisorder")
     FakeSplit,
+}
+
+/// How a fake is kept away from the server while the DPI still reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fooling {
+    /// IP TTL low enough to expire between the DPI and the server
+    Ttl(u8),
+    /// broken TCP/UDP checksum
+    BadSum,
+    /// sequence/ack numbers far outside the server's window (zapret "badseq")
+    BadSeq,
 }
 
 #[derive(Clone, Debug)]
 pub struct Profile {
-    // ---- Engine A: TCP/TLS ----
+    // ---- TCP/TLS ----
     pub method: Method,
     pub split: SplitAt,
     pub disorder: bool,
-    /// 0 = no TTL-limited fake
-    pub fake_ttl: u8,
-    pub bad_sum: bool,
+    pub fooling: Fooling,
     pub fake_count: u8,
     pub fake_sni: String,
-    // ---- Engine A: UDP ----
+    // ---- UDP ----
     pub discord_fakes: u8,
     pub drop_quic: bool,
 }
@@ -57,9 +65,8 @@ impl Default for Profile {
             method: Method::SeqOvl,
             split: SplitAt::SniMid,
             disorder: true,
-            fake_ttl: 6,
-            bad_sum: false,
-            fake_count: 1,
+            fooling: Fooling::BadSeq,
+            fake_count: 6,
             fake_sni: "www.google.com".into(),
             discord_fakes: 6,
             drop_quic: true,
@@ -123,7 +130,6 @@ mod tests {
     #[test]
     fn split_resolution() {
         assert_eq!(SplitAt::SniMid.resolve(100, 20, 500), 110);
-        assert_eq!(SplitAt::SniStart(1).resolve(100, 20, 500), 101);
         assert_eq!(SplitAt::Fixed(1000).resolve(0, 0, 500), 499);
         assert_eq!(SplitAt::Fixed(0).resolve(0, 0, 500), 1);
     }

@@ -59,6 +59,12 @@ pub fn build_tcp(orig: &[u8], ihl: usize, ps: usize, seq_add: u32, payload: &[u8
     v
 }
 
+/// Move the acknowledgment number of a built TCP segment `back` bytes into the past.
+pub fn shift_ack(v: &mut [u8], ihl: usize, back: u32) {
+    let ack = u32::from_be_bytes([v[ihl + 8], v[ihl + 9], v[ihl + 10], v[ihl + 11]]).wrapping_sub(back);
+    v[ihl + 8..ihl + 12].copy_from_slice(&ack.to_be_bytes());
+}
+
 /// Clone IP+UDP headers of `orig` around a new payload.
 pub fn build_udp(orig: &[u8], ihl: usize, payload: &[u8], ttl: Option<u8>) -> Vec<u8> {
     let mut v = Vec::with_capacity(ihl + 8 + payload.len());
@@ -206,6 +212,10 @@ mod tests {
         assert_eq!(s[8], 5);
         assert_eq!(u32::from_be_bytes([s[24], s[25], s[26], s[27]]), 1007);
         assert_eq!(&s[44..], b"abc");
+        let mut f = build_tcp(&p, t.ihl, t.ps, 0u32.wrapping_sub(10000), b"x", None);
+        shift_ack(&mut f, t.ihl, 66000);
+        assert_eq!(u32::from_be_bytes([f[24], f[25], f[26], f[27]]), 1000u32.wrapping_sub(10000));
+        assert_eq!(u32::from_be_bytes([f[28], f[29], f[30], f[31]]), 0u32.wrapping_sub(66000));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Engine C — autonomous strategy prober (self-healing loop).
 //!
-//! Grid over [split offset x fake TTL x BadSum] against real TLS endpoints, each candidate
-//! swapped into the shared profile live. The prober's own ClientHellos are captured and
-//! desynchronized by the packet engine exactly like normal traffic, so a successful handshake +
-//! HTTP reply proves the strategy works on this ISP.
+//! Each candidate strategy is swapped into the shared profile live, then every target gets a
+//! raw TLS ClientHello the size of a modern Chromium one (post-quantum key share, ~1.8 KB, so
+//! it spans two TCP segments exactly like the Discord app's and the browser's). The prober's
+//! own packets go through the packet engine like normal traffic; a ServerHello coming back
+//! proves the DPI let the handshake through.
 //!
 //! Every swap also applies to the user's own connections, so the search is kept short: the
 //! current profile is tried first and the first candidate that reaches every target wins. The
@@ -11,16 +12,14 @@
 
 pub mod profile;
 
-use profile::{Method, Profile, Shared, SplitAt};
+use crate::windivert_engine::tls;
+use profile::{Fooling, Method, Profile, Shared, SplitAt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// YouTube front page and video redirector, plus the hosts the Discord app needs to get past
 /// its splash screen (updater, API, gateway).
@@ -31,55 +30,35 @@ const HTTPS_TARGETS: &[&str] = &[
     "updates.discord.com",
     "gateway.discord.gg",
 ];
-const HTTPS_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Chromium's ClientHello with X25519MLKEM768 is ~1.7-1.9 KB: larger than one segment.
+const PROBE_HELLO_LEN: usize = 1780;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const RECHECK: Duration = Duration::from_secs(300);
 const RETRY_AFTER_FAIL: Duration = Duration::from_secs(60);
 
-fn tls_config() -> Arc<ClientConfig> {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut c = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("tls versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    c.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(c)
-}
-
-/// TLS handshake + first bytes of an HTTP response. Returns total latency on success.
-async fn probe_https(host: &str, cfg: &Arc<ClientConfig>) -> Option<Duration> {
+/// Sends a Chromium-sized ClientHello and waits for the ServerHello (or HelloRetryRequest).
+/// Returns the latency on success.
+async fn probe_tls(host: &str) -> Option<Duration> {
     let t0 = Instant::now();
     let run = async {
         let addr = tokio::net::lookup_host((host, 443)).await.ok()?.find(|a| a.is_ipv4())?;
-        let tcp = TcpStream::connect(addr).await.ok()?;
+        let mut tcp = TcpStream::connect(addr).await.ok()?;
         tcp.set_nodelay(true).ok()?;
-        let sn = ServerName::try_from(host.to_string()).ok()?;
-        let mut tls = TlsConnector::from(cfg.clone()).connect(sn, tcp).await.ok()?;
-        let req = format!(
-            "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-        );
-        tls.write_all(req.as_bytes()).await.ok()?;
-        let mut b = [0u8; 8];
-        let mut got = 0usize;
-        while got < 5 {
-            let n = tls.read(&mut b[got..]).await.ok()?;
-            if n == 0 {
-                break;
-            }
-            got += n;
-        }
-        (got >= 5 && &b[..5] == b"HTTP/").then_some(())
+        tcp.write_all(&tls::build_fake_client_hello_len(host, PROBE_HELLO_LEN)).await.ok()?;
+        // record header (5) + handshake type (1)
+        let mut b = [0u8; 6];
+        tcp.read_exact(&mut b).await.ok()?;
+        (b[0] == 0x16 && b[5] == 0x02).then_some(())
     };
-    match timeout(HTTPS_TIMEOUT, run).await {
+    match timeout(PROBE_TIMEOUT, run).await {
         Ok(Some(())) => Some(t0.elapsed()),
         _ => None,
     }
 }
 
 /// Probe all targets concurrently -> (which succeeded, summed latency of the successes).
-async fn probe_all(cfg: &Arc<ClientConfig>) -> (Vec<bool>, Duration) {
-    let rs = futures_util::future::join_all(HTTPS_TARGETS.iter().map(|h| probe_https(h, cfg))).await;
+async fn probe_all() -> (Vec<bool>, Duration) {
+    let rs = futures_util::future::join_all(HTTPS_TARGETS.iter().map(|h| probe_tls(h))).await;
     let total: Duration = rs.iter().flatten().sum();
     (rs.iter().map(Option::is_some).collect(), total)
 }
@@ -88,29 +67,46 @@ fn failed_hosts(ok: &[bool]) -> String {
     HTTPS_TARGETS.iter().zip(ok).filter(|(_, ok)| !**ok).map(|(h, _)| *h).collect::<Vec<_>>().join(", ")
 }
 
-/// The current profile first, then seqovl (zapret-discord-youtube's default), then
-/// [Split Offset x Fake TTL (3..12, plus "none") x BadSum], cheapest / most common first.
-fn candidates(base: &Profile) -> Vec<Profile> {
-    let splits = [SplitAt::SniMid, SplitAt::SniStart(1), SplitAt::Fixed(1)];
-    let ttls: [u8; 11] = [0, 6, 4, 8, 5, 7, 3, 9, 10, 11, 12];
-    let mut out = vec![base.clone()];
-    if base.method != Method::SeqOvl {
-        let mut p = base.clone();
-        p.method = Method::SeqOvl;
-        out.push(p);
+fn describe(p: &Profile) -> String {
+    match p.method {
+        Method::SeqOvl => "seqovl".into(),
+        Method::Fake => format!("fake x{} {:?}", p.fake_count, p.fooling),
+        Method::FakeSplit => format!(
+            "fake x{} {:?} + split {:?}{}",
+            p.fake_count,
+            p.fooling,
+            p.split,
+            if p.disorder { " disorder" } else { "" }
+        ),
     }
-    for &ttl in &ttls {
-        for &bad in &[false, true] {
-            for &split in &splits {
-                let mut p = base.clone();
-                p.method = Method::FakeSplit;
-                p.split = split;
-                p.disorder = true;
-                p.fake_ttl = ttl;
-                p.bad_sum = bad;
-                p.fake_count = if ttl == 0 && !bad { 0 } else { 1 };
-                out.push(p);
-            }
+}
+
+/// The current profile first, then the strategies zapret-discord-youtube ships, most commonly
+/// working first: seqovl, plain fakes, fakes + disorder split; fakes fooled by bad sequence
+/// numbers, TTL (4..8) or bad checksum.
+fn candidates(base: &Profile) -> Vec<Profile> {
+    let foolings = [
+        Fooling::BadSeq,
+        Fooling::Ttl(6),
+        Fooling::Ttl(4),
+        Fooling::Ttl(8),
+        Fooling::Ttl(5),
+        Fooling::Ttl(7),
+        Fooling::BadSum,
+    ];
+    let mut out = vec![base.clone()];
+    let mut seqovl = base.clone();
+    seqovl.method = Method::SeqOvl;
+    out.push(seqovl);
+    for (method, split) in [(Method::Fake, SplitAt::SniMid), (Method::FakeSplit, SplitAt::SniMid), (Method::FakeSplit, SplitAt::Fixed(1))] {
+        for &fooling in &foolings {
+            let mut p = base.clone();
+            p.method = method;
+            p.split = split;
+            p.disorder = true;
+            p.fooling = fooling;
+            p.fake_count = if fooling == Fooling::BadSeq { 11 } else { 6 };
+            out.push(p);
         }
     }
     out
@@ -118,13 +114,14 @@ fn candidates(base: &Profile) -> Vec<Profile> {
 
 /// Returns false only when nothing reached any target (a partial result is kept and re-checked
 /// on the normal schedule).
-async fn search(shared: &Shared, cfg: &Arc<ClientConfig>) -> bool {
+async fn search(shared: &Shared) -> bool {
     let need = HTTPS_TARGETS.len();
     let mut best: Option<(usize, Duration, Vec<bool>, Profile)> = None;
     for cand in candidates(&shared.load_full()) {
         shared.store(Arc::new(cand.clone()));
-        let (oks, total) = probe_all(cfg).await;
+        let (oks, total) = probe_all().await;
         let ok = oks.iter().filter(|o| **o).count();
+        debug!("candidate {}: {ok}/{need}", describe(&cand));
         if ok == 0 {
             continue;
         }
@@ -141,13 +138,7 @@ async fn search(shared: &Shared, cfg: &Arc<ClientConfig>) -> bool {
     }
     match best {
         Some((ok, total, oks, p)) => {
-            match p.method {
-                Method::SeqOvl => info!("strategy: {ok}/{need} targets, {total:?} -> seqovl"),
-                Method::FakeSplit => info!(
-                    "strategy: {ok}/{need} targets, {total:?} -> fake+split split={:?} ttl={} badsum={}",
-                    p.split, p.fake_ttl, p.bad_sum
-                ),
-            }
+            info!("strategy: {ok}/{need} targets, {total:?} -> {}", describe(&p));
             if ok < need {
                 warn!("still unreachable with the best strategy: {}", failed_hosts(&oks));
             }
@@ -163,12 +154,11 @@ async fn search(shared: &Shared, cfg: &Arc<ClientConfig>) -> bool {
 }
 
 pub async fn run(shared: Shared) {
-    let cfg = tls_config();
     let mut need = true; // always search on startup
     let mut fails = 0u32;
     loop {
         if !need {
-            let (oks, _) = probe_all(&cfg).await;
+            let (oks, _) = probe_all().await;
             fails = if oks.iter().all(|o| *o) { 0 } else { fails + 1 };
             // a single flaky probe must not trigger a search (it swaps live strategies)
             if fails >= 2 {
@@ -179,7 +169,7 @@ pub async fn run(shared: Shared) {
         }
         if need {
             info!("probing strategies");
-            need = !search(&shared, &cfg).await;
+            need = !search(&shared).await;
         }
         sleep(if need { RETRY_AFTER_FAIL } else { RECHECK }).await;
     }

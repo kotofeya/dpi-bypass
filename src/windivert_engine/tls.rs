@@ -94,6 +94,7 @@ fn build_client_hello(sni: &str, pad_total: usize) -> Vec<u8> {
     push_ext(&mut ext, 0x0000, &sn);
     push_ext(&mut ext, 0x000a, &[0, 4, 0, 0x1d, 0, 0x17]);
     push_ext(&mut ext, 0x000d, &[0, 8, 4, 3, 8, 4, 4, 1, 5, 3]);
+    push_ext(&mut ext, 0x0010, &[0, 12, 2, b'h', b'2', 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']);
     push_ext(&mut ext, 0x002b, &[2, 3, 4]);
     let mut ks = vec![0, 36, 0, 0x1d, 0, 32];
     ks.extend((0..32).map(|_| fastrand::u8(..)));
@@ -106,7 +107,7 @@ fn build_client_hello(sni: &str, pad_total: usize) -> Vec<u8> {
     body.extend((0..32).map(|_| fastrand::u8(..)));
     body.push(32);
     body.extend((0..32).map(|_| fastrand::u8(..)));
-    body.extend_from_slice(&[0, 6, 0x13, 0x01, 0x13, 0x02, 0xc0, 0x2b]);
+    body.extend_from_slice(&[0, 8, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b]);
     body.extend_from_slice(&[1, 0]);
     body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
     body.extend_from_slice(&ext);

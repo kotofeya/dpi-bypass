@@ -1,7 +1,8 @@
 //! Engine A — WinDivert packet loop (network layer).
 //!
 //!  * TLS ClientHello with a target SNI (443 and Discord's 2053/2083/2087/2096/8443),
-//!    HTTP/80 request with a target Host -> "seqovl" split (default) or fake + split + disorder
+//!    HTTP/80 request with a target Host -> "seqovl" split, fakes only, or fakes + split
+//!    (+ disorder); fakes fooled by TTL, bad checksum or bad sequence numbers
 //!  * UDP/443 QUIC Initial with a target SNI      -> dropped (app falls back to TCP/TLS)
 //!  * UDP to Discord voice ports (19294-19344, 50000-50100) -> N decoy datagrams before
 //!    each of the first 3 packets of a flow
@@ -23,10 +24,15 @@ mod imp {
     use super::ffi::{Address, Divert};
     use super::packet::{self, Tcp4};
     use super::{quic, tls};
-    use crate::prober::profile::{is_google, is_target, Method, Profile, Shared};
+    use crate::prober::profile::{is_google, is_target, Fooling, Method, Profile, Shared};
     use anyhow::Result;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    /// zapret's badseq defaults: the fake sits 10000 bytes before the real data and acks
+    /// 66000 bytes back, so the server discards it while a stateless DPI still parses it.
+    const BADSEQ_SEQ: u32 = 10000;
+    const BADSEQ_ACK: u32 = 66000;
 
     enum Action {
         /// caller re-injects the original packet
@@ -146,14 +152,15 @@ mod imp {
                 self.emit(addr, s2, ihl + 16, false)?;
                 return Ok(Action::Consumed);
             }
-            tracing::debug!("{} {host}:{} -> fake+split", if t.dport == 80 { "HTTP" } else { "TLS" }, t.dport);
+            let kind = if t.dport == 80 { "HTTP" } else { "TLS" };
+            tracing::debug!("{kind} {host}:{} -> {:?} x{} {:?}", t.dport, p.method, p.fake_count, p.fooling);
 
-            // 1) decoys: same 4-tuple + same seq as the real data, but never accepted by the server
-            let ttl = (p.fake_ttl > 0).then_some(p.fake_ttl);
-            if p.fake_count > 0 && (ttl.is_some() || p.bad_sum) {
-                for _ in 0..p.fake_count {
-                    self.emit(addr, packet::build_tcp(pkt, ihl, ps, 0, &fake, ttl), ihl + 16, p.bad_sum)?;
-                }
+            // 1) decoys: same 4-tuple as the real data, but never accepted by the server
+            for _ in 0..p.fake_count.max(1) {
+                self.emit_fake(p.fooling, addr, pkt, ihl, ps, &fake)?;
+            }
+            if p.method == Method::Fake {
+                return Ok(Action::Pass); // the original segment follows the decoys
             }
 
             // 2) real data in two segments, optionally out of order
@@ -167,6 +174,19 @@ mod imp {
                 self.emit(addr, s2, ihl + 16, false)?;
             }
             Ok(Action::Consumed)
+        }
+
+        /// One fake TCP segment carrying `fake`, made unacceptable to the server by `fooling`.
+        fn emit_fake(&self, fooling: Fooling, addr: &Address, pkt: &[u8], ihl: usize, ps: usize, fake: &[u8]) -> Result<()> {
+            match fooling {
+                Fooling::Ttl(ttl) => self.emit(addr, packet::build_tcp(pkt, ihl, ps, 0, fake, Some(ttl)), ihl + 16, false),
+                Fooling::BadSum => self.emit(addr, packet::build_tcp(pkt, ihl, ps, 0, fake, None), ihl + 16, true),
+                Fooling::BadSeq => {
+                    let mut v = packet::build_tcp(pkt, ihl, ps, 0u32.wrapping_sub(BADSEQ_SEQ), fake, None);
+                    packet::shift_ack(&mut v, ihl, BADSEQ_ACK);
+                    self.emit(addr, v, ihl + 16, false)
+                }
+            }
         }
 
         /// Fix checksums, optionally corrupt the L4 checksum afterwards (the "BadSum" fake), inject.
@@ -209,11 +229,16 @@ mod imp {
                 let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
                 let first = self.voice.lock().unwrap().needs_decoys(sport, dst, dport, Instant::now());
                 if first {
-                    let ttl = (p.fake_ttl > 0).then_some(p.fake_ttl);
+                    // UDP has no sequence numbers: "badseq" decoys simply go out as they are
+                    let (ttl, bad_sum) = match p.fooling {
+                        Fooling::Ttl(t) => (Some(t), false),
+                        Fooling::BadSum => (None, true),
+                        Fooling::BadSeq => (None, false),
+                    };
                     let n = p.discord_fakes.clamp(1, 10);
                     for i in 0..n {
                         let fake = packet::voice_decoy(i);
-                        self.emit(addr, packet::build_udp(pkt, ihl, &fake, ttl), ihl + 6, p.bad_sum)?;
+                        self.emit(addr, packet::build_udp(pkt, ihl, &fake, ttl), ihl + 6, bad_sum)?;
                     }
                     tracing::debug!("discord voice {dst}:{dport} ({} bytes): {n} decoys", payload.len());
                 }
