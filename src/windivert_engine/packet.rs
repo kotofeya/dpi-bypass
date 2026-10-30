@@ -1,8 +1,10 @@
 //! Pure IPv4/IPv6 + TCP/UDP packet surgery used by the WinDivert loop. Checksums are left
 //! zeroed here; the caller recomputes them with WinDivertHelperCalcChecksums before injecting.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
@@ -154,11 +156,75 @@ pub fn http_host(payload: &[u8]) -> Option<(usize, String)> {
 /// MTProto destination ports Telegram clients use.
 pub const TG_PORTS: [u16; 3] = [443, 80, 5222];
 
+/// UDP port ranges of Discord voice (RTC) servers.
+pub const DISCORD_VOICE_PORTS: [(u16, u16); 2] = [(19294, 19344), (50000, 50100)];
+
+pub fn is_discord_voice_port(p: u16) -> bool {
+    DISCORD_VOICE_PORTS.iter().any(|(lo, hi)| (*lo..=*hi).contains(&p))
+}
+
+/// Number of leading packets of a voice flow that get decoys in front of them (zapret's
+/// "cutoff=d3"): the blocking decision is made on the first datagrams only.
+pub const VOICE_CUTOFF: u8 = 3;
+const VOICE_FLOW_IDLE: Duration = Duration::from_secs(120);
+
+/// Per-flow packet counter for outbound voice UDP, keyed by (src port, dst ip, dst port).
+#[derive(Default)]
+pub struct VoiceFlows {
+    flows: HashMap<(u16, Ipv4Addr, u16), (u8, Instant)>,
+}
+
+impl VoiceFlows {
+    /// Counts a packet; true while the flow is still within the first `VOICE_CUTOFF` packets.
+    pub fn needs_decoys(&mut self, sport: u16, dst: Ipv4Addr, dport: u16, now: Instant) -> bool {
+        if self.flows.len() > 4096 {
+            self.flows.retain(|_, (_, t)| now.duration_since(*t) < VOICE_FLOW_IDLE);
+        }
+        let e = self.flows.entry((sport, dst, dport)).or_insert((0, now));
+        if now.duration_since(e.1) >= VOICE_FLOW_IDLE {
+            e.0 = 0; // port reused for a new call
+        }
+        e.1 = now;
+        if e.0 >= VOICE_CUTOFF {
+            return false;
+        }
+        e.0 += 1;
+        true
+    }
+}
+
+/// Decoy datagram number `i` for a voice flow: alternates between a Discord IP-discovery
+/// request with a random SSRC, a STUN Binding request, zeros and random noise.
+pub fn voice_decoy(i: u8) -> Vec<u8> {
+    match i % 4 {
+        0 => {
+            let mut v = vec![0u8; 74];
+            v[..4].copy_from_slice(&[0, 1, 0, 70]);
+            v[4..8].iter_mut().for_each(|b| *b = fastrand::u8(..));
+            v
+        }
+        1 => {
+            let mut v = vec![0u8; 20];
+            v[..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
+            v[4..8].copy_from_slice(&0x2112_a442u32.to_be_bytes()); // magic cookie
+            v[8..20].iter_mut().for_each(|b| *b = fastrand::u8(..));
+            v
+        }
+        2 => vec![0u8; 74],
+        _ => (0..fastrand::usize(40..=120)).map(|_| fastrand::u8(..)).collect(),
+    }
+}
+
 /// The single WinDivert filter for Engine A.
 pub fn filter(bridge_port: u16) -> String {
     let ranges = crate::obfs2::telegram_v4_ranges()
         .iter()
         .map(|(lo, hi)| format!("(ip.DstAddr >= {lo} and ip.DstAddr <= {hi})"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let voice = DISCORD_VOICE_PORTS
+        .iter()
+        .map(|(lo, hi)| format!("(udp.DstPort >= {lo} and udp.DstPort <= {hi})"))
         .collect::<Vec<_>>()
         .join(" or ");
     let ports = TG_PORTS.iter().map(|p| format!("tcp.DstPort == {p}")).collect::<Vec<_>>().join(" or ");
@@ -169,7 +235,7 @@ pub fn filter(bridge_port: u16) -> String {
  (ip and tcp.DstPort == 443 and tcp.PayloadLength > 5 and tcp.Payload[0] == 22 and tcp.Payload[5] == 1) or \
  (ip and tcp.DstPort == 80 and tcp.PayloadLength > 0 and tcp.Payload[0] >= 65 and tcp.Payload[0] <= 90) or \
  (ip and udp.DstPort == 443 and udp.PayloadLength >= 1200) or \
- (ip and udp.DstPort >= 50000 and udp.PayloadLength == 74) or \
+ (ip and udp.PayloadLength > 0 and ({voice})) or \
  (ipv6 and tcp.Syn and !tcp.Ack and ({ports})))"
     )
 }
@@ -249,5 +315,23 @@ mod tests {
         let f = filter(17443);
         assert!(f.contains("tcp.SrcPort == 17443"));
         assert!(f.contains("ip.DstAddr >= 149.154.160.0 and ip.DstAddr <= 149.154.175.255"));
+        assert!(f.contains("(udp.DstPort >= 19294 and udp.DstPort <= 19344)"));
+    }
+
+    #[test]
+    fn voice_cutoff_and_decoys() {
+        let mut v = VoiceFlows::default();
+        let ip = Ipv4Addr::new(66, 22, 196, 10);
+        let t = Instant::now();
+        let hits: Vec<bool> = (0..5).map(|_| v.needs_decoys(60000, ip, 50004, t)).collect();
+        assert_eq!(hits, [true, true, true, false, false]);
+        assert!(v.needs_decoys(60001, ip, 50004, t)); // new flow
+        assert!(v.needs_decoys(60000, ip, 50004, t + VOICE_FLOW_IDLE)); // reused after idle
+        assert!(is_discord_voice_port(19300) && is_discord_voice_port(50100) && !is_discord_voice_port(50101));
+
+        let d = voice_decoy(0);
+        assert_eq!((d.len(), &d[..4]), (74, &[0u8, 1, 0, 70][..]));
+        let s = voice_decoy(1);
+        assert_eq!((s.len(), &s[4..8]), (20, &[0x21u8, 0x12, 0xa4, 0x42][..]));
     }
 }
