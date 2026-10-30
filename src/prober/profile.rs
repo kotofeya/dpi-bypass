@@ -65,7 +65,7 @@ impl Default for Profile {
             bad_sum: false,
             fake_count: 1,
             fake_sni: "www.google.com".into(),
-            discord_fakes: 3,
+            discord_fakes: 6,
             drop_quic: true,
             ws_method: WsMethod::Fragment,
             ws_split: SplitAt::SniMid,

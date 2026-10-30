@@ -6,7 +6,8 @@
 //!  * TCP/443 TLS ClientHello with a target SNI  -> [fake(s)] + split + (disorder)
 //!  * TCP/80  HTTP request with a target Host     -> same, split inside "Host"
 //!  * UDP/443 QUIC Initial with a YouTube SNI     -> dropped (browser falls back to TCP/TLS)
-//!  * UDP/50000+ 74-byte Discord IP-discovery     -> N fake datagrams injected first
+//!  * UDP to Discord voice ports (19294-19344, 50000-50100) -> N decoy datagrams before
+//!    each of the first 3 packets of a flow
 //!
 //! Everything not matched is re-injected untouched. Packets we inject via WinDivertSend are
 //! not captured again by this handle, so there is no feedback loop.
@@ -29,8 +30,8 @@ mod imp {
     use crate::obfs2;
     use crate::prober::profile::{is_target, is_youtube, Profile, Shared};
     use anyhow::Result;
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     enum Action {
         /// caller re-injects the original packet
@@ -44,12 +45,13 @@ mod imp {
         profile: Shared,
         nat: Arc<NatTable>,
         bridge_port: u16,
+        voice: Mutex<packet::VoiceFlows>,
     }
 
     impl Engine {
         pub fn open(profile: Shared, nat: Arc<NatTable>, bridge_port: u16) -> Result<Self> {
             let dv = Arc::new(Divert::open(&packet::filter(bridge_port), 0)?);
-            Ok(Self { dv, profile, nat, bridge_port })
+            Ok(Self { dv, profile, nat, bridge_port, voice: Mutex::new(packet::VoiceFlows::default()) })
         }
 
         /// Stops `run` (from any thread).
@@ -283,22 +285,23 @@ mod imp {
                 });
             }
 
-            // Discord voice IP discovery: type=0x0001, length=70, SSRC, 64B address, 2B port = 74 bytes
-            if dport >= 50000 && payload.len() == 74 && payload[..4] == [0, 1, 0, 70] {
-                let ttl = (p.fake_ttl > 0).then_some(p.fake_ttl);
-                let n = p.discord_fakes.min(4);
-                for i in 0..n {
-                    let fake: Vec<u8> = match i % 3 {
-                        0 => vec![0u8; 74],
-                        1 => (0..74).map(|_| fastrand::u8(..)).collect(),
-                        _ => (0..fastrand::usize(40..=120)).map(|_| fastrand::u8(..)).collect(),
-                    };
-                    self.emit(addr, packet::build_udp(pkt, ihl, &fake, ttl), ihl + 6, p.bad_sum)?;
+            // Discord voice (RTC): decoys in front of the first datagrams of every flow, whatever
+            // they carry (IP discovery, STUN, or encrypted RTP straight away).
+            if packet::is_discord_voice_port(dport) && !payload.is_empty() {
+                let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+                let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+                let first = self.voice.lock().unwrap().needs_decoys(sport, dst, dport, Instant::now());
+                if first {
+                    let ttl = (p.fake_ttl > 0).then_some(p.fake_ttl);
+                    let n = p.discord_fakes.clamp(1, 10);
+                    for i in 0..n {
+                        let fake = packet::voice_decoy(i);
+                        self.emit(addr, packet::build_udp(pkt, ihl, &fake, ttl), ihl + 6, p.bad_sum)?;
+                    }
+                    tracing::debug!("discord voice {dst}:{dport} ({} bytes): {n} decoys", payload.len());
                 }
-                tracing::debug!("discord voice handshake: {n} fakes");
-                return Ok(Action::Pass); // real packet follows the decoys
             }
-            Ok(Action::Pass)
+            Ok(Action::Pass) // the real datagram follows the decoys
         }
     }
 }
