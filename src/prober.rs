@@ -12,8 +12,11 @@
 //!   2. grid over [WS method x split x record-split] against kws2.web.telegram.org with the
 //!      stage-1 winner already locked; best = lowest WebSocket handshake latency.
 //!
-//! The winner is stored into the shared ArcSwap profile. The loop re-checks health every
-//! 5 minutes and immediately when Engine B reports repeated gateway failures.
+//! The winner is stored into the shared ArcSwap profile. The two stages are re-checked
+//! independently every 5 minutes: stage 1 re-runs only after two failed YouTube/Discord checks
+//! in a row, stage 2 re-runs when Engine B reports repeated gateway failures and backs off
+//! (up to 15 minutes) while the gateways stay unreachable, so a blocked Telegram never makes
+//! the prober churn the packet strategy under live traffic.
 
 pub mod profile;
 
@@ -25,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
@@ -39,6 +42,7 @@ const HTTPS_TIMEOUT: Duration = Duration::from_millis(2500);
 const WS_TIMEOUT: Duration = Duration::from_secs(5);
 const RECHECK: Duration = Duration::from_secs(300);
 const RETRY_AFTER_FAIL: Duration = Duration::from_secs(60);
+const WS_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 
 /// TLS handshake + first bytes of an HTTP response. Returns total latency on success.
 async fn probe_https(host: &str, cfg: &Arc<ClientConfig>) -> Option<Duration> {
@@ -127,56 +131,50 @@ fn stage2(base: &Profile) -> Vec<Profile> {
     out
 }
 
-async fn healthy(cfg: &Arc<ClientConfig>, dialer: &WsDialer, engine_a: bool) -> bool {
-    if engine_a {
-        let (ok, _) = probe_all(cfg).await;
-        if ok < HTTPS_TARGETS.len() {
-            return false;
+/// Stage 1: packet-level strategy for Engine A. Returns false only when nothing reached any
+/// target (a partial result is kept and re-checked on the normal schedule).
+async fn search_packet(shared: &Shared, cfg: &Arc<ClientConfig>) -> bool {
+    let mut base: Profile = (*shared.load_full()).clone();
+    let need = HTTPS_TARGETS.len();
+    let mut best: Option<(usize, Duration, Profile)> = None;
+    let mut full = 0usize;
+    for cand in stage1(&base) {
+        shared.store(Arc::new(cand.clone()));
+        let (ok, total) = probe_all(cfg).await;
+        if ok == 0 {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((bo, bt, _)) => ok > *bo || (ok == *bo && total < *bt),
+        };
+        if better {
+            best = Some((ok, total, cand));
+        }
+        if ok == need {
+            full += 1;
+            if full >= 4 {
+                break; // enough full-success candidates; the best of them wins
+            }
         }
     }
-    probe_ws(dialer).await.is_some()
+    let found = best.is_some();
+    match best {
+        Some((ok, total, p)) => {
+            info!("stage 1: {ok}/{need} targets, {total:?} total -> split={:?} ttl={} badsum={}", p.split, p.fake_ttl, p.bad_sum);
+            base = p;
+        }
+        None => warn!("stage 1: no packet-level strategy reached any target"),
+    }
+    shared.store(Arc::new(base.clone()));
+    info!("locked profile: {base:?}");
+    found
 }
 
-/// Full search. Returns true when every available engine ended up with a working strategy.
-async fn search(shared: &Shared, cfg: &Arc<ClientConfig>, dialer: &WsDialer, engine_a: bool) -> bool {
-    let mut base: Profile = (*shared.load_full()).clone();
-    let mut a_ok = !engine_a;
-
-    if engine_a {
-        let need = HTTPS_TARGETS.len();
-        let mut best: Option<(usize, Duration, Profile)> = None;
-        let mut full = 0usize;
-        for cand in stage1(&base) {
-            shared.store(Arc::new(cand.clone()));
-            let (ok, total) = probe_all(cfg).await;
-            if ok == 0 {
-                continue;
-            }
-            let better = match &best {
-                None => true,
-                Some((bo, bt, _)) => ok > *bo || (ok == *bo && total < *bt),
-            };
-            if better {
-                best = Some((ok, total, cand));
-            }
-            if ok == need {
-                full += 1;
-                if full >= 4 {
-                    break; // enough full-success candidates; the best of them wins
-                }
-            }
-        }
-        match best {
-            Some((ok, total, p)) => {
-                info!("stage 1: {ok}/{need} targets, {total:?} total -> split={:?} ttl={} badsum={}", p.split, p.fake_ttl, p.bad_sum);
-                a_ok = ok == need;
-                base = p;
-            }
-            None => warn!("stage 1: no packet-level strategy reached any target"),
-        }
-        shared.store(Arc::new(base.clone()));
-    }
-
+/// Stage 2: WebSocket dialer strategy for Engine B. Only touches the ws_* fields, so it never
+/// disturbs YouTube / Discord traffic while it runs.
+async fn search_ws(shared: &Shared, dialer: &WsDialer) -> bool {
+    let base: Profile = (*shared.load_full()).clone();
     let _ = probe_ws(dialer).await; // warm DNS cache so the first candidate isn't penalised
     let mut best_ws: Option<(Duration, Profile)> = None;
     for cand in stage2(&base) {
@@ -187,17 +185,23 @@ async fn search(shared: &Shared, cfg: &Arc<ClientConfig>, dialer: &WsDialer, eng
             }
         }
     }
-    let ws_ok = best_ws.is_some();
+    // keep whatever stage 1 may have stored meanwhile; only the ws_* fields are ours
+    let mut cur: Profile = (*shared.load_full()).clone();
+    let src = best_ws.as_ref().map(|(_, p)| p).unwrap_or(&base);
+    cur.ws_method = src.ws_method;
+    cur.ws_split = src.ws_split;
+    cur.ws_record_split = src.ws_record_split;
+    shared.store(Arc::new(cur));
     match best_ws {
         Some((t, p)) => {
             info!("stage 2: {WS_TARGET} in {t:?} -> ws_method={:?} split={:?} record_split={}", p.ws_method, p.ws_split, p.ws_record_split);
-            base = p;
+            true
         }
-        None => warn!("stage 2: no WebSocket strategy reached {WS_TARGET}"),
+        None => {
+            warn!("stage 2: no WebSocket strategy reached {WS_TARGET}");
+            false
+        }
     }
-    shared.store(Arc::new(base.clone()));
-    info!("locked profile: {base:?}");
-    a_ok && ws_ok
 }
 
 /// Cloudflare DoH (1.1.1.1) answers for a Telegram gateway name.
@@ -228,32 +232,72 @@ pub async fn run(shared: Shared, ctx: Arc<Ctx>, engine_a: bool) {
     let cfg = mk_cfg(true);
     let dialer = ctx.dialer.clone();
     let trigger = ctx.probe.clone();
-    let mut need = true; // always search on startup
+    // always search on startup
+    let mut need_packet = engine_a;
+    let mut need_ws = true;
+    let mut packet_fails = 0u32;
+    let mut ws_backoff = RETRY_AFTER_FAIL;
     loop {
         let cf = probe_cloudflare(&dialer).await;
         if cf != dialer.doh_ok.swap(cf, Ordering::Relaxed) {
             info!("Cloudflare DoH {}", if cf { "reachable" } else { "unreachable, DoH fallback disabled" });
         }
-        if !need {
-            need = !healthy(&cfg, &dialer, engine_a).await;
-            if need {
-                warn!("health check failed, re-probing");
+
+        // Engine A: a single flaky probe must not trigger a full re-search (it swaps live
+        // strategies under the user's traffic), so require two failed checks in a row.
+        if engine_a && !need_packet {
+            let (ok, _) = probe_all(&cfg).await;
+            packet_fails = if ok < HTTPS_TARGETS.len() { packet_fails + 1 } else { 0 };
+            if packet_fails >= 2 {
+                warn!("YouTube/Discord health check failed twice ({ok}/{}), re-probing", HTTPS_TARGETS.len());
+                need_packet = true;
+                packet_fails = 0;
             }
         }
-        let mut wait = RECHECK;
-        if need {
-            info!("engine C: probing strategies");
-            if search(&shared, &cfg, &dialer, engine_a).await {
-                need = false;
+        if need_packet {
+            info!("engine C: probing packet strategies");
+            need_packet = !search_packet(&shared, &cfg).await;
+        }
+
+        // Engine B: independent of Engine A; backs off while the gateways stay unreachable.
+        if !need_ws && probe_ws(&dialer).await.is_none() {
+            warn!("Telegram gateway health check failed, re-probing WebSocket strategies");
+            need_ws = true;
+        }
+        if need_ws {
+            if search_ws(&shared, &dialer).await {
+                need_ws = false;
+                ws_backoff = RETRY_AFTER_FAIL;
             } else {
-                warn!("engine C: no fully working profile, retrying in {RETRY_AFTER_FAIL:?}");
-                wait = RETRY_AFTER_FAIL;
+                warn!(
+                    "Telegram gateways unreachable with every strategy (address-level block?); next try in {ws_backoff:?}"
+                );
             }
         }
         probe_gateways(&ctx).await;
-        tokio::select! {
-            _ = trigger.notified() => {}
-            _ = sleep(wait) => {}
+
+        let wait = if need_packet {
+            RETRY_AFTER_FAIL
+        } else if need_ws {
+            let w = ws_backoff;
+            ws_backoff = (ws_backoff * 2).min(WS_BACKOFF_MAX);
+            w
+        } else {
+            RECHECK
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            tokio::select! {
+                _ = trigger.notified() => {
+                    // Engine B reports failing gateways: worth an early look only if we
+                    // currently believe they work (otherwise we are already backing off).
+                    if !need_ws {
+                        need_ws = true;
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
         }
     }
 }
