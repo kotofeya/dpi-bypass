@@ -1,5 +1,9 @@
 //! Engine C — autonomous strategy prober (self-healing loop).
 //!
+//! Besides the strategy search below it keeps two health signals fresh for Engine B:
+//! Cloudflare DoH reachability (lets the dialer skip a dead DoH fallback) and the latency /
+//! failure state of every kws{1..5} WebSocket gateway (orders gateway candidates per DC).
+//!
 //! Two stages, each probing with the candidate profile swapped in live:
 //!   1. (only when Engine A is running) grid over [split offset x fake TTL x BadSum] against
 //!      real TLS endpoints. The prober's own ClientHellos are captured and desynchronized by
@@ -7,16 +11,20 @@
 //!      the strategy works on this ISP. Best = most targets reachable, then lowest latency.
 //!   2. grid over [WS method x split x record-split] against kws2.web.telegram.org with the
 //!      stage-1 winner already locked; best = lowest WebSocket handshake latency.
+//!
 //! The winner is stored into the shared ArcSwap profile. The loop re-checks health every
 //! 5 minutes and immediately when Engine B reports repeated gateway failures.
 
-use crate::dialer::{mk_cfg, WsDialer};
-use crate::profile::{Profile, Shared, SplitAt, WsMethod};
+pub mod profile;
+
+use crate::tg_bridge::dialer::{mk_cfg, WsDialer};
+use crate::tg_bridge::Ctx;
+use profile::{Profile, Shared, SplitAt, WsMethod};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Notify;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::ClientConfig;
@@ -192,10 +200,40 @@ async fn search(shared: &Shared, cfg: &Arc<ClientConfig>, dialer: &WsDialer, eng
     a_ok && ws_ok
 }
 
-pub async fn run(shared: Shared, dialer: Arc<WsDialer>, trigger: Arc<Notify>, engine_a: bool) {
+/// Cloudflare DoH (1.1.1.1) answers for a Telegram gateway name.
+async fn probe_cloudflare(d: &WsDialer) -> bool {
+    matches!(timeout(Duration::from_secs(5), d.doh(WS_TARGET)).await, Ok(Ok(v)) if !v.is_empty())
+}
+
+/// Handshake latency of every DC's primary gateway, recorded into the bridge's health table.
+async fn probe_gateways(ctx: &Ctx) {
+    let hosts: Vec<String> = (1..=5).map(|dc| format!("kws{dc}.web.telegram.org")).collect();
+    let rs = futures_util::future::join_all(hosts.iter().map(|h| async move {
+        let t0 = Instant::now();
+        let ok = matches!(timeout(WS_TIMEOUT, ctx.dialer.connect(h)).await, Ok(Ok(_)));
+        (h, ok, t0.elapsed())
+    }))
+    .await;
+    for (h, ok, t) in rs {
+        if ok {
+            ctx.gateways.record_ok(h, t);
+        } else {
+            ctx.gateways.record_fail(h);
+        }
+    }
+    info!("gateways: {}", ctx.gateways.summary());
+}
+
+pub async fn run(shared: Shared, ctx: Arc<Ctx>, engine_a: bool) {
     let cfg = mk_cfg(true);
+    let dialer = ctx.dialer.clone();
+    let trigger = ctx.probe.clone();
     let mut need = true; // always search on startup
     loop {
+        let cf = probe_cloudflare(&dialer).await;
+        if cf != dialer.doh_ok.swap(cf, Ordering::Relaxed) {
+            info!("Cloudflare DoH {}", if cf { "reachable" } else { "unreachable, DoH fallback disabled" });
+        }
         if !need {
             need = !healthy(&cfg, &dialer, engine_a).await;
             if need {
@@ -212,6 +250,7 @@ pub async fn run(shared: Shared, dialer: Arc<WsDialer>, trigger: Arc<Notify>, en
                 wait = RETRY_AFTER_FAIL;
             }
         }
+        probe_gateways(&ctx).await;
         tokio::select! {
             _ = trigger.notified() => {}
             _ = sleep(wait) => {}
