@@ -50,6 +50,7 @@ mod imp {
         profile: Shared,
         voice: Mutex<packet::VoiceFlows>,
         reasm: Mutex<Reassembler<Address>>,
+        quic: Mutex<quic::QuicTracker>,
     }
 
     impl Engine {
@@ -60,6 +61,7 @@ mod imp {
                 profile,
                 voice: Mutex::new(packet::VoiceFlows::default()),
                 reasm: Mutex::new(Reassembler::default()),
+                quic: Mutex::new(quic::QuicTracker::default()),
             })
         }
 
@@ -298,13 +300,8 @@ mod imp {
                 if !p.drop_quic {
                     return Ok(Action::Pass);
                 }
-                return Ok(match quic::initial_sni(payload) {
-                    Some(s) if is_target(&s) => {
-                        tracing::debug!("QUIC {s} dropped -> TCP fallback");
-                        Action::Consumed
-                    }
-                    _ => Action::Pass,
-                });
+                let drop = self.quic.lock().unwrap().should_drop(payload, Instant::now(), is_target);
+                return Ok(if drop == Some(true) { Action::Consumed } else { Action::Pass });
             }
 
             // Discord voice (RTC): decoys in front of the first datagrams of every flow, whatever
