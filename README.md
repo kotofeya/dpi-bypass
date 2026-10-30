@@ -37,3 +37,16 @@ exclusion for the project folder if the build reports that the zip "contains a v
 
 Start `dpi-bypass.exe`. If it is not elevated, it relaunches itself through UAC. Add `-v` for
 per-packet debug logs. Wait for `locked profile` in the log before testing.
+
+## Start at logon
+
+From an Administrator PowerShell:
+
+```powershell
+.\dpi-bypass.exe --install
+```
+
+This registers a Task Scheduler task (elevated, no UAC prompt, no console window) that starts the
+exe at every logon and restarts it if it crashes. Logs go to `dpi-bypass.log` next to the exe.
+`--uninstall` removes the task. Stop the running copy before rebuilding or moving the exe.
+
