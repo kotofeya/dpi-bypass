@@ -1,5 +1,6 @@
 //! Minimal TLS ClientHello parser (SNI + offset) and fake ClientHello builder.
 
+#[derive(Clone, Debug)]
 pub struct Hello {
     pub sni: String,
     /// offset of the hostname bytes relative to the start of the slice that was parsed
@@ -60,17 +61,25 @@ fn push_ext(out: &mut Vec<u8>, ty: u16, data: &[u8]) {
 
 /// Plausible TLS 1.3 ClientHello carrying `sni`; used as the decoy payload for fakes.
 pub fn build_fake_client_hello(sni: &str) -> Vec<u8> {
-    build_client_hello(sni, 0)
+    build_client_hello(sni, 0, false)
 }
 
 /// Same, grown to exactly `len` bytes with a padding extension (RFC 7685) when `len` is larger
 /// than the bare hello.
 pub fn build_fake_client_hello_len(sni: &str, len: usize) -> Vec<u8> {
-    let bare = build_client_hello(sni, 0).len();
+    let bare = build_client_hello(sni, 0, false).len();
     if len < bare + 4 {
-        return build_client_hello(sni, 0);
+        return build_client_hello(sni, 0, false);
     }
-    build_client_hello(sni, len - bare)
+    build_client_hello(sni, len - bare, false)
+}
+
+/// Chromium-like probe hello of `len` bytes. Chromium shuffles its extension order, so the SNI
+/// often lands after the ~1.2 KB post-quantum key share, i.e. in the second TCP segment: this
+/// puts it last on purpose, the hardest case for anything that inspects only the first segment.
+pub fn build_probe_client_hello(sni: &str, len: usize) -> Vec<u8> {
+    let bare = build_client_hello(sni, 0, true).len();
+    build_client_hello(sni, len.saturating_sub(bare), true)
 }
 
 /// Bytes placed in front of the real data by the "seqovl" split: whole fake ClientHellos of
@@ -82,7 +91,8 @@ pub fn seqovl_pattern(sni: &str, unit: usize, ovl: usize) -> Vec<u8> {
 }
 
 /// `pad_total`: bytes the padding extension occupies including its 4-byte header (0 = none).
-fn build_client_hello(sni: &str, pad_total: usize) -> Vec<u8> {
+/// `sni_last`: put the server_name extension after everything else (including the padding).
+fn build_client_hello(sni: &str, pad_total: usize, sni_last: bool) -> Vec<u8> {
     let name = sni.as_bytes();
     let mut sn = Vec::new();
     sn.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
@@ -91,7 +101,9 @@ fn build_client_hello(sni: &str, pad_total: usize) -> Vec<u8> {
     sn.extend_from_slice(name);
 
     let mut ext = Vec::new();
-    push_ext(&mut ext, 0x0000, &sn);
+    if !sni_last {
+        push_ext(&mut ext, 0x0000, &sn);
+    }
     push_ext(&mut ext, 0x000a, &[0, 4, 0, 0x1d, 0, 0x17]);
     push_ext(&mut ext, 0x000d, &[0, 8, 4, 3, 8, 4, 4, 1, 5, 3]);
     push_ext(&mut ext, 0x0010, &[0, 12, 2, b'h', b'2', 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1']);
@@ -101,6 +113,9 @@ fn build_client_hello(sni: &str, pad_total: usize) -> Vec<u8> {
     push_ext(&mut ext, 0x0033, &ks);
     if pad_total >= 4 {
         push_ext(&mut ext, 0x0015, &vec![0u8; pad_total - 4]);
+    }
+    if sni_last {
+        push_ext(&mut ext, 0x0000, &sn);
     }
 
     let mut body = vec![3, 3];
@@ -136,6 +151,13 @@ mod tests {
             assert_eq!(parse_client_hello(&p).unwrap().sni, "www.google.com");
             assert_eq!(u16::from_be_bytes([p[3], p[4]]) as usize, len - 5);
         }
+        // SNI placed after a long extension is only found once the second segment is there
+        let late = build_probe_client_hello("discord.com", 1780);
+        assert_eq!(late.len(), 1780);
+        assert!(parse_client_hello(&late[..1460]).is_none());
+        let full = parse_client_hello(&late).unwrap();
+        assert_eq!(full.sni, "discord.com");
+        assert!(full.sni_off > 1460);
         let pat = seqovl_pattern("4pda.to", 284, 568);
         assert_eq!(pat.len(), 568);
         assert_eq!(pat[..5], pat[284..289]);

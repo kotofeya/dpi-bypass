@@ -1,6 +1,7 @@
 //! Engine A — WinDivert packet loop (network layer).
 //!
-//!  * TLS ClientHello with a target SNI (443 and Discord's 2053/2083/2087/2096/8443),
+//!  * TLS ClientHello with a target SNI (443 and Discord's 2053/2083/2087/2096/8443); a hello
+//!    whose SNI is not in the first segment is held until the next one arrives (reasm.rs);
 //!    HTTP/80 request with a target Host -> "seqovl" split, fakes only, or fakes + split
 //!    (+ disorder); fakes fooled by TTL, bad checksum or bad sequence numbers
 //!  * UDP/443 QUIC Initial with a target SNI      -> dropped (app falls back to TCP/TLS)
@@ -14,6 +15,7 @@
 pub mod ffi;
 pub mod packet;
 pub mod quic;
+pub mod reasm;
 pub mod tls;
 
 #[cfg(windows)]
@@ -23,6 +25,8 @@ pub use imp::Engine;
 mod imp {
     use super::ffi::{Address, Divert};
     use super::packet::{self, Tcp4};
+    use super::reasm::{Held, Reassembler, Step};
+    use super::tls::Hello;
     use super::{quic, tls};
     use crate::prober::profile::{is_google, is_target, Fooling, Method, Profile, Shared};
     use anyhow::Result;
@@ -45,12 +49,18 @@ mod imp {
         dv: Arc<Divert>,
         profile: Shared,
         voice: Mutex<packet::VoiceFlows>,
+        reasm: Mutex<Reassembler<Address>>,
     }
 
     impl Engine {
         pub fn open(profile: Shared) -> Result<Self> {
             let dv = Arc::new(Divert::open(&packet::filter(), 0)?);
-            Ok(Self { dv, profile, voice: Mutex::new(packet::VoiceFlows::default()) })
+            Ok(Self {
+                dv,
+                profile,
+                voice: Mutex::new(packet::VoiceFlows::default()),
+                reasm: Mutex::new(Reassembler::default()),
+            })
         }
 
         /// Stops `run` (from any thread).
@@ -103,75 +113,150 @@ mod imp {
 
         fn on_tcp(&self, p: &Profile, pkt: &[u8], addr: &Address) -> Result<Action> {
             let Some(t) = Tcp4::parse(pkt) else { return Ok(Action::Pass) };
-            if t.ps < pkt.len() && (t.dport == 80 || packet::TLS_PORTS.contains(&t.dport)) {
-                return self.desync(p, pkt, addr, &t);
-            }
-            Ok(Action::Pass)
-        }
-
-        fn desync(&self, p: &Profile, pkt: &[u8], addr: &Address, t: &Tcp4) -> Result<Action> {
-            let (ihl, ps) = (t.ihl, t.ps);
-            let payload = &pkt[ps..];
-
-            if payload.len() < 2 {
+            if t.ps >= pkt.len() {
                 return Ok(Action::Pass);
             }
-            let (host, split, fake) = if t.dport != 80 {
-                let Some(h) = tls::parse_client_hello(payload) else { return Ok(Action::Pass) };
-                if !is_target(&h.sni) {
-                    return Ok(Action::Pass);
-                }
-                let k = p.split.resolve(h.sni_off, h.sni.len(), payload.len());
-                (h.sni, k, tls::build_fake_client_hello(&p.fake_sni))
-            } else {
-                let Some((i, host)) = packet::http_host(payload) else { return Ok(Action::Pass) };
-                if !is_target(&host) {
-                    return Ok(Action::Pass);
-                }
-                let k = (i + 4).clamp(1, payload.len() - 1); // "\r\nHo|st:"
-                (host, k, format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", p.fake_sni).into_bytes())
+            if t.dport == 80 {
+                return self.on_http(p, pkt, addr, &t);
+            }
+            if !packet::TLS_PORTS.contains(&t.dport) {
+                return Ok(Action::Pass);
+            }
+
+            let now = Instant::now();
+            let (stale, step) = {
+                let mut r = self.reasm.lock().unwrap();
+                (r.sweep(now), r.on_data(pkt, *addr, &t, now))
             };
+            self.release(stale);
+            match step {
+                Step::Pass => Ok(Action::Pass),
+                Step::Hold => Ok(Action::Consumed),
+                Step::Hello(h) => {
+                    let payload = &pkt[t.ps..];
+                    self.on_hello(p, pkt, addr, &t, payload, payload.len(), &h)
+                }
+                Step::Assembled(a) => {
+                    let first = &a.segs[0];
+                    let res = match Tcp4::parse(&first.pkt) {
+                        Some(t0) => self.on_hello(p, &first.pkt, &first.addr, &t0, &a.data, a.mss, &a.hello),
+                        None => Ok(Action::Pass),
+                    };
+                    if !matches!(res, Ok(Action::Consumed)) {
+                        // nothing was sent in place of the held segments: send them as they were
+                        if let Err(e) = &res {
+                            tracing::debug!("assembled hello: {e:#}");
+                        }
+                        self.release(a.segs);
+                    }
+                    Ok(Action::Consumed)
+                }
+                Step::Release(v) => {
+                    self.release(v);
+                    Ok(Action::Consumed)
+                }
+            }
+        }
+
+        /// Re-injects held packets unchanged.
+        fn release(&self, held: Vec<Held<Address>>) {
+            for h in held {
+                if let Err(e) = self.dv.send(&h.pkt, &h.addr) {
+                    tracing::debug!("release: {e}");
+                }
+            }
+        }
+
+        /// A TLS ClientHello whose SNI is known. `payload` is the whole (possibly reassembled)
+        /// message starting at the sequence number of `pkt`.
+        #[allow(clippy::too_many_arguments)]
+        fn on_hello(
+            &self,
+            p: &Profile,
+            pkt: &[u8],
+            addr: &Address,
+            t: &Tcp4,
+            payload: &[u8],
+            mss: usize,
+            h: &Hello,
+        ) -> Result<Action> {
+            if !is_target(&h.sni) || payload.len() < 2 {
+                return Ok(Action::Pass);
+            }
+            let split = p.split.resolve(h.sni_off, h.sni.len(), payload.len());
+            let fake = tls::build_fake_client_hello(&p.fake_sni);
+            self.apply(p, pkt, addr, t, payload, mss, &h.sni, split, &fake)
+        }
+
+        fn on_http(&self, p: &Profile, pkt: &[u8], addr: &Address, t: &Tcp4) -> Result<Action> {
+            let payload = &pkt[t.ps..];
+            let Some((i, host)) = packet::http_host(payload) else { return Ok(Action::Pass) };
+            if !is_target(&host) || payload.len() < 2 {
+                return Ok(Action::Pass);
+            }
+            let split = (i + 4).clamp(1, payload.len() - 1); // "\r\nHo|st:"
+            let fake = format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", p.fake_sni).into_bytes();
+            self.apply(p, pkt, addr, t, payload, payload.len(), &host, split, &fake)
+        }
+
+        /// Runs the strategy on `payload`, the message that starts at the sequence number of
+        /// `pkt`. Every injected segment carries at most `mss` payload bytes, so a reassembled
+        /// hello re-cut at an arbitrary offset never exceeds the MTU. Returns `Pass` when the
+        /// original data is still to be sent by the caller (plain fakes).
+        #[allow(clippy::too_many_arguments)]
+        fn apply(
+            &self,
+            p: &Profile,
+            pkt: &[u8],
+            addr: &Address,
+            t: &Tcp4,
+            payload: &[u8],
+            mss: usize,
+            host: &str,
+            split: usize,
+            fake: &[u8],
+        ) -> Result<Action> {
+            let (ihl, ps) = (t.ihl, t.ps);
+            let kind = if t.dport == 80 { "HTTP" } else { "TLS" };
 
             if p.method == Method::SeqOvl {
-                // [fake hello bytes | payload[0]] at seq-ovl, then payload[1..]: the DPI sees the
-                // fake SNI first, the server trims the bytes that precede its receive window.
-                let google = is_google(&host);
+                // [fake hello bytes | payload[0]] placed `ovl` bytes before the real data, then
+                // payload[1..]: the DPI reads the fake SNI first, the server trims the bytes that
+                // precede its receive window.
+                let google = is_google(host);
                 let (sni, unit, ovl) = if google { ("www.google.com", 681, 681) } else { ("4pda.to", 284, 568) };
-                let pattern = tls::seqovl_pattern(sni, unit, ovl);
-                let mut first = pattern;
+                let mut first = tls::seqovl_pattern(sni, unit, ovl);
                 first.push(payload[0]);
-                let mut s1 = packet::build_tcp(pkt, ihl, ps, 0u32.wrapping_sub(ovl as u32), &first, None);
-                let mut s2 = packet::build_tcp(pkt, ihl, ps, 1, &payload[1..], None);
+                let mut out = packet::segments(pkt, ihl, ps, 0u32.wrapping_sub(ovl as u32), &first, mss);
+                out.extend(packet::segments(pkt, ihl, ps, 1, &payload[1..], mss));
                 if google {
                     // ip-id=zero, as zapret does for Google
-                    s1[4..6].fill(0);
-                    s2[4..6].fill(0);
+                    out.iter_mut().for_each(|s| s[4..6].fill(0));
                 }
-                tracing::debug!("{} {host}:{} -> seqovl {ovl}", if t.dport == 80 { "HTTP" } else { "TLS" }, t.dport);
-                self.emit(addr, s1, ihl + 16, false)?;
-                self.emit(addr, s2, ihl + 16, false)?;
+                tracing::debug!("{kind} {host}:{} -> seqovl {ovl}, {} segments", t.dport, out.len());
+                for s in out {
+                    self.emit(addr, s, ihl + 16, false)?;
+                }
                 return Ok(Action::Consumed);
             }
-            let kind = if t.dport == 80 { "HTTP" } else { "TLS" };
             tracing::debug!("{kind} {host}:{} -> {:?} x{} {:?}", t.dport, p.method, p.fake_count, p.fooling);
 
             // 1) decoys: same 4-tuple as the real data, but never accepted by the server
             for _ in 0..p.fake_count.max(1) {
-                self.emit_fake(p.fooling, addr, pkt, ihl, ps, &fake)?;
+                self.emit_fake(p.fooling, addr, pkt, ihl, ps, fake)?;
             }
             if p.method == Method::Fake {
-                return Ok(Action::Pass); // the original segment follows the decoys
+                return Ok(Action::Pass); // the original segment(s) follow the decoys
             }
 
-            // 2) real data in two segments, optionally out of order
-            let s1 = packet::build_tcp(pkt, ihl, ps, 0, &payload[..split], None);
-            let s2 = packet::build_tcp(pkt, ihl, ps, split as u32, &payload[split..], None);
+            // 2) real data cut at `split`, optionally sent in reverse order
+            let mut out = packet::segments(pkt, ihl, ps, 0, &payload[..split], mss);
+            out.extend(packet::segments(pkt, ihl, ps, split as u32, &payload[split..], mss));
             if p.disorder {
-                self.emit(addr, s2, ihl + 16, false)?;
-                self.emit(addr, s1, ihl + 16, false)?;
-            } else {
-                self.emit(addr, s1, ihl + 16, false)?;
-                self.emit(addr, s2, ihl + 16, false)?;
+                out.reverse();
+            }
+            for s in out {
+                self.emit(addr, s, ihl + 16, false)?;
             }
             Ok(Action::Consumed)
         }

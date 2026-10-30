@@ -14,7 +14,11 @@ pub struct Tcp4 {
     pub ihl: usize,
     /// payload start (IP header + TCP header)
     pub ps: usize,
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub sport: u16,
     pub dport: u16,
+    pub seq: u32,
 }
 
 impl Tcp4 {
@@ -33,7 +37,11 @@ impl Tcp4 {
         Some(Tcp4 {
             ihl,
             ps: ihl + thl,
+            src: Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]),
+            dst: Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]),
+            sport: u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]),
             dport: u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]),
+            seq: u32::from_be_bytes([pkt[ihl + 4], pkt[ihl + 5], pkt[ihl + 6], pkt[ihl + 7]]),
         })
     }
 }
@@ -57,6 +65,16 @@ pub fn build_tcp(orig: &[u8], ihl: usize, ps: usize, seq_add: u32, payload: &[u8
     v[ihl + 16] = 0;
     v[ihl + 17] = 0;
     v
+}
+
+/// Cuts `data`, which starts `seq_add` bytes after the sequence number of `orig`, into
+/// segments of at most `mss` payload bytes, each cloned from `orig`'s headers.
+pub fn segments(orig: &[u8], ihl: usize, ps: usize, seq_add: u32, data: &[u8], mss: usize) -> Vec<Vec<u8>> {
+    let mss = mss.max(1);
+    data.chunks(mss)
+        .enumerate()
+        .map(|(i, c)| build_tcp(orig, ihl, ps, seq_add.wrapping_add((i * mss) as u32), c, None))
+        .collect()
 }
 
 /// Move the acknowledgment number of a built TCP segment `back` bytes into the past.
@@ -172,7 +190,7 @@ pub fn filter() -> String {
     let tls = TLS_PORTS.iter().map(|p| format!("tcp.DstPort == {p}")).collect::<Vec<_>>().join(" or ");
     format!(
         "outbound and !loopback and ip and (\
- (({tls}) and tcp.PayloadLength > 5 and tcp.Payload[0] == 22 and tcp.Payload[5] == 1) or \
+ (({tls}) and tcp.PayloadLength > 0) or \
  (tcp.DstPort == 80 and tcp.PayloadLength > 0 and tcp.Payload[0] >= 65 and tcp.Payload[0] <= 90) or \
  (udp.DstPort == 443 and udp.PayloadLength >= 1200) or \
  (udp.PayloadLength > 0 and ({voice})))"
@@ -205,7 +223,12 @@ mod tests {
     fn build_segments() {
         let p = syn();
         let t = Tcp4::parse(&p).unwrap();
-        assert_eq!((t.dport, t.ps), (443, 44));
+        assert_eq!((t.dport, t.ps, t.sport, t.seq), (443, 44, 50000, 1000));
+        assert_eq!(t.dst, Ipv4Addr::new(162, 159, 135, 232));
+        let segs = segments(&p, t.ihl, t.ps, 5, &[7u8; 250], 100);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[2].len(), 44 + 50);
+        assert_eq!(Tcp4::parse(&segs[1]).unwrap().seq, 1105);
         let s = build_tcp(&p, t.ihl, t.ps, 7, b"abc", Some(5));
         assert_eq!(s.len(), 47);
         assert_eq!(u16::from_be_bytes([s[2], s[3]]), 47);
@@ -224,6 +247,7 @@ mod tests {
         assert_eq!((i, h.as_str()), (14, "t.me"));
         let f = filter();
         assert!(f.contains("tcp.DstPort == 2053"));
+        assert!(f.contains("tcp.PayloadLength > 0"));
         assert!(f.contains("(udp.DstPort >= 19294 and udp.DstPort <= 19344)"));
     }
 

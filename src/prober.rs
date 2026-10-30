@@ -2,7 +2,8 @@
 //!
 //! Each candidate strategy is swapped into the shared profile live, then every target gets a
 //! raw TLS ClientHello the size of a modern Chromium one (post-quantum key share, ~1.8 KB, so
-//! it spans two TCP segments exactly like the Discord app's and the browser's). The prober's
+//! it spans two TCP segments exactly like the Discord app's and the browser's), with the SNI in
+//! the second segment, the worst case Chromium's extension shuffling produces. The prober's
 //! own packets go through the packet engine like normal traffic; a ServerHello coming back
 //! proves the DPI let the handshake through.
 //!
@@ -44,7 +45,7 @@ async fn probe_tls(host: &str) -> Option<Duration> {
         let addr = tokio::net::lookup_host((host, 443)).await.ok()?.find(|a| a.is_ipv4())?;
         let mut tcp = TcpStream::connect(addr).await.ok()?;
         tcp.set_nodelay(true).ok()?;
-        tcp.write_all(&tls::build_fake_client_hello_len(host, PROBE_HELLO_LEN)).await.ok()?;
+        tcp.write_all(&tls::build_probe_client_hello(host, PROBE_HELLO_LEN)).await.ok()?;
         // record header (5) + handshake type (1)
         let mut b = [0u8; 6];
         tcp.read_exact(&mut b).await.ok()?;
