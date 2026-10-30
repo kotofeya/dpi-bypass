@@ -1,5 +1,5 @@
-//! Shared, hot-swappable strategy profile. Engine C (prober) will `store()` a new
-//! Arc<Profile>; Engines A and B call `load_full()` per packet / per dial.
+//! Shared, hot-swappable strategy profile. The prober `store()`s a new Arc<Profile>;
+//! the packet engine calls `load_full()` per packet.
 
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -26,16 +26,6 @@ impl SplitAt {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WsMethod {
-    /// plain TLS, leave desync to Engine A (WinDivert)
-    Plain,
-    /// user-space TCP split (+ optional TLS record split) of our own ClientHello
-    Fragment,
-    /// do not send SNI at all (certificate is still verified against the real name)
-    NoSni,
-}
-
 #[derive(Clone, Debug)]
 pub struct Profile {
     // ---- Engine A: TCP/TLS ----
@@ -49,11 +39,6 @@ pub struct Profile {
     // ---- Engine A: UDP ----
     pub discord_fakes: u8,
     pub drop_quic: bool,
-    // ---- Engine B: WS dialer ----
-    pub ws_method: WsMethod,
-    pub ws_split: SplitAt,
-    pub ws_record_split: bool,
-    pub ws_delay_ms: u64,
 }
 
 impl Default for Profile {
@@ -67,10 +52,6 @@ impl Default for Profile {
             fake_sni: "www.google.com".into(),
             discord_fakes: 6,
             drop_quic: true,
-            ws_method: WsMethod::Fragment,
-            ws_split: SplitAt::SniMid,
-            ws_record_split: true,
-            ws_delay_ms: 2,
         }
     }
 }
@@ -84,7 +65,7 @@ pub fn shared_default() -> Shared {
 const TARGETS: &[&str] = &[
     "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "youtube-nocookie.com",
     "discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media", "discordcdn.com",
-    "web.telegram.org", "telegram.org", "t.me", "telegram.me",
+    "discordstatus.com", "dis.gd", "discord.co", "discord-attachments-uploads-prd.storage.googleapis.com",
 ];
 const YOUTUBE: &[&str] = &["youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "youtube-nocookie.com"];
 
@@ -94,3 +75,27 @@ fn matches(host: &str, list: &[&str]) -> bool {
 }
 pub fn is_target(host: &str) -> bool { matches(host, TARGETS) }
 pub fn is_youtube(host: &str) -> bool { matches(host, YOUTUBE) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_matching() {
+        assert!(is_target("gateway.discord.gg"));
+        assert!(is_target("updates.discord.com"));
+        assert!(is_target("rr3---sn-abc.googlevideo.com"));
+        assert!(is_target("WWW.YouTube.com."));
+        assert!(!is_target("notdiscord.com"));
+        assert!(!is_target("web.telegram.org"));
+        assert!(is_youtube("i.ytimg.com") && !is_youtube("discord.com"));
+    }
+
+    #[test]
+    fn split_resolution() {
+        assert_eq!(SplitAt::SniMid.resolve(100, 20, 500), 110);
+        assert_eq!(SplitAt::SniStart(1).resolve(100, 20, 500), 101);
+        assert_eq!(SplitAt::Fixed(1000).resolve(0, 0, 500), 499);
+        assert_eq!(SplitAt::Fixed(0).resolve(0, 0, 500), 1);
+    }
+}

@@ -24,8 +24,7 @@ const INVALID_HANDLE: isize = -1;
 /// WINDIVERT_ADDRESS (WinDivert 2.2): 80 bytes.
 /// flags bit layout: Layer:8 Event:8 Sniffed:1 Outbound:1 Loopback:1 Impostor:1 IPv6:1
 ///                   IPChecksum:1 TCPChecksum:1 UDPChecksum:1 Reserved1:8
-/// data (network layer): IfIdx:u32 SubIfIdx:u32 — kept as-is when reflecting a packet, so
-/// the "inbound" copy is delivered on the interface the original left from.
+/// data (network layer): IfIdx:u32 SubIfIdx:u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Address {
@@ -35,22 +34,17 @@ pub struct Address {
     pub data: [u8; 64],
 }
 
-const OUTBOUND_BIT: u32 = 1 << 17;
-
 impl Address {
     pub fn zeroed() -> Self {
         Address { timestamp: 0, flags: 0, reserved2: 0, data: [0; 64] }
     }
-    pub fn set_outbound(&mut self, v: bool) {
-        if v {
-            self.flags |= OUTBOUND_BIT;
-        } else {
-            self.flags &= !OUTBOUND_BIT;
-        }
-    }
 }
 
-// Linked by build.rs (WinDivert.lib, delay-loaded).
+// Linked by build.rs (WinDivert.lib, delay-loaded). On MSVC the functions must also be
+// declared dllimport (`kind = "dylib"`), otherwise calls go through the import library's
+// jump thunks and link.exe can drop /DELAYLOAD with LNK4199. The GNU build links its own
+// delay-import library from build.rs instead.
+#[cfg_attr(target_env = "msvc", link(name = "WinDivert", kind = "dylib"))]
 extern "C" {
     fn WinDivertOpen(filter: *const c_char, layer: i32, priority: i16, flags: u64) -> *mut c_void;
     fn WinDivertRecv(h: *mut c_void, pkt: *mut c_void, len: u32, recv_len: *mut u32, addr: *mut Address) -> i32;
