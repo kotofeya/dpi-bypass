@@ -24,8 +24,7 @@ const INVALID_HANDLE: isize = -1;
 /// WINDIVERT_ADDRESS (WinDivert 2.2): 80 bytes.
 /// flags bit layout: Layer:8 Event:8 Sniffed:1 Outbound:1 Loopback:1 Impostor:1 IPv6:1
 ///                   IPChecksum:1 TCPChecksum:1 UDPChecksum:1 Reserved1:8
-/// data (network layer): IfIdx:u32 SubIfIdx:u32 — kept as-is when reflecting a packet, so
-/// the "inbound" copy is delivered on the interface the original left from.
+/// data (network layer): IfIdx:u32 SubIfIdx:u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Address {
@@ -35,18 +34,9 @@ pub struct Address {
     pub data: [u8; 64],
 }
 
-const OUTBOUND_BIT: u32 = 1 << 17;
-
 impl Address {
     pub fn zeroed() -> Self {
         Address { timestamp: 0, flags: 0, reserved2: 0, data: [0; 64] }
-    }
-    pub fn set_outbound(&mut self, v: bool) {
-        if v {
-            self.flags |= OUTBOUND_BIT;
-        } else {
-            self.flags &= !OUTBOUND_BIT;
-        }
     }
 }
 

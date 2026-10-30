@@ -1,7 +1,7 @@
 # Project Specification: Unified Network Resilience & Traffic Optimization Client (Windows)
 
 ## Role & Execution Mode
-You are an autonomous Principal Systems Engineer and Low-Level Network Architect working in Claude Code. Your task is to design, implement, compile, and verify a 100% standalone, serverless Windows desktop client in **Rust** that mitigates ISP middlebox traffic degradation and stateful inspection for **YouTube**, **Discord (HTTPS + WebRTC Voice)**, and **Telegram Desktop** without requiring external VPS servers or manual proxy configuration in user apps.
+You are an autonomous Principal Systems Engineer and Low-Level Network Architect working in Claude Code. Your task is to design, implement, compile, and verify a 100% standalone, serverless Windows desktop client in **Rust** that mitigates ISP middlebox traffic degradation and stateful inspection for **YouTube** and **Discord (HTTPS + WebRTC Voice)** without requiring external VPS servers or manual proxy configuration in user apps.
 
 ## Core Directives for Claude Code
 1. **Zero Placeholders:** Never write `// TODO`, `unimplemented!()`, or stub functions. Write complete byte-level packet parsing, cryptographic, and socket handling logic.
@@ -18,8 +18,10 @@ You are an autonomous Principal Systems Engineer and Low-Level Network Architect
 ├── vendor/windivert/        # Downloaded WinDivert.dll, WinDivert64.sys, WinDivert.lib
 └── src/
     ├── main.rs              # Privilege check, NIC IP discovery, engine orchestration
-    ├── nat_table.rs         # Lock-free DashMap Stateful NAT for transparent redirection
-    ├── windivert_engine.rs  # Engine A: WinDivert packet loop (TLS split, Fake, UDP, NAT)
-    ├── obfs2.rs             # AES-256-CTR MTProto Obfuscated2 parser & IP-to-DC mapper
-    ├── tg_bridge.rs         # Engine B: Transparent TCP -> WSS (kws1..5.web.telegram.org)
-    └── prober.rs            # Engine C: Background strategy & Cloudflare/Gateway health prober
+    ├── windivert_engine.rs  # Engine A: WinDivert packet loop (TLS split, Fake, QUIC, voice UDP)
+    └── prober.rs            # Engine C: Background strategy prober & health checks
+```
+
+Telegram support (Engine B: transparent TCP -> WSS bridge, NAT table, obfuscated2) was removed:
+on the target network Telegram's IP ranges, including the kws*.web.telegram.org gateways, are
+blocked at the address level, which no local desync can get around.

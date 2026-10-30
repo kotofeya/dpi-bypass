@@ -1,15 +1,11 @@
-//! Serverless DPI mitigation client for YouTube, Discord and Telegram Desktop (Windows).
+//! Serverless DPI mitigation client for YouTube and Discord (Windows).
 //!
-//!  Engine A (windivert_engine) — packet-level desync + transparent Telegram redirect
-//!  Engine B (tg_bridge)        — Telegram MTProto over wss://kws*.web.telegram.org
-//!  Engine C (prober)           — strategy search and gateway / Cloudflare health checks
+//!  Engine A (windivert_engine) — packet-level desync (TLS/HTTP split + fakes, QUIC, voice UDP)
+//!  Engine C (prober)           — strategy search and health checks
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
-mod nat_table;
-mod obfs2;
 mod prober;
-mod tg_bridge;
 mod windivert_engine;
 
 #[cfg(not(windows))]
@@ -39,17 +35,14 @@ fn main() -> anyhow::Result<()> {
 
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "dpi-bypass [-v | --log <filter>] [--no-elevate] [--bridge-port N]\n\n\
-             Runs elevated (relaunches itself via UAC). -v shows packet-level debug logs.\n\
-             Without Administrator rights only the SOCKS5 ({}) and MTProxy ({}) fallbacks run.",
-            tg_bridge::SOCKS_ADDR,
-            tg_bridge::MTP_ADDR
+            "dpi-bypass [-v | --log <filter>]\n\n\
+             Needs Administrator rights (relaunches itself via UAC) to load the WinDivert driver.\n\
+             -v shows packet-level debug logs."
         );
         return Ok(());
     }
 
-    let elevated = win::is_elevated();
-    if !elevated && !args.iter().any(|a| a == "--no-elevate") {
+    if !win::is_elevated() {
         if arg_value(&args, "--log").is_none() {
             args.push("--log".into());
             args.push(filter.clone());
@@ -59,118 +52,41 @@ fn main() -> anyhow::Result<()> {
                 tracing::info!("relaunched elevated, exiting this instance");
                 return Ok(());
             }
-            Err(e) => tracing::warn!("elevation declined/failed ({e}); running without the packet engine"),
+            Err(e) => anyhow::bail!("Administrator rights are required to load the WinDivert driver ({e})"),
         }
     }
 
-    let bridge_port = args
-        .iter()
-        .position(|a| a == "--bridge-port")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(tg_bridge::DEFAULT_BRIDGE_PORT);
-
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run(elevated, bridge_port))
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
 }
 
 #[cfg(windows)]
-async fn run(elevated: bool, bridge_port: u16) -> anyhow::Result<()> {
+async fn run() -> anyhow::Result<()> {
     use std::sync::Arc;
-    use std::time::Duration;
-    use tracing::{error, info, warn};
+    use tracing::{info, warn};
 
     match win::primary_ipv4() {
         Some(ip) => info!("primary interface address: {ip}"),
-        None => warn!("no IPv4 default route found; transparent Telegram redirect needs IPv4"),
+        None => warn!("no IPv4 default route found; only IPv4 traffic is handled"),
     }
 
     let shared = prober::profile::shared_default();
-    let nat = Arc::new(nat_table::NatTable::new());
-    let dialer = Arc::new(tg_bridge::dialer::WsDialer::new(shared.clone(), nat.clone(), vec![]));
-    let ctx = Arc::new(tg_bridge::Ctx::new(dialer, tg_bridge::load_secret()));
-
-    // The transparent listener must exist before WinDivert starts reflecting SYNs into it.
-    // Reflected flows arrive as inbound connections from Telegram addresses, so the firewall
-    // has to let them reach the bridge port.
-    if elevated {
-        if let Err(e) = win::allow_bridge_port(bridge_port) {
-            warn!("firewall rule for port {bridge_port} not installed: {e}");
-        }
-    }
-    let transparent = if elevated {
-        match tg_bridge::bind_transparent(bridge_port).await {
-            Ok(l) => Some(l),
-            Err(e) => {
-                error!("cannot bind bridge port {bridge_port}: {e:#} (try --bridge-port)");
-                None
+    let engine = Arc::new(windivert_engine::Engine::open(shared.clone())?);
+    let a_thread = {
+        let e = engine.clone();
+        std::thread::Builder::new().name("engine-a".into()).spawn(move || {
+            if let Err(err) = e.run() {
+                tracing::error!("engine A stopped: {err:#}");
             }
-        }
-    } else {
-        None
+        })?
     };
 
-    // Engine A
-    let engine = match &transparent {
-        Some(_) => match windivert_engine::Engine::open(shared.clone(), nat.clone(), bridge_port) {
-            Ok(e) => Some(Arc::new(e)),
-            Err(e) => {
-                error!("Engine A disabled: {e:#}");
-                None
-            }
-        },
-        None => None,
-    };
-    let a_thread = engine.as_ref().map(|e| {
-        let e = e.clone();
-        std::thread::Builder::new()
-            .name("engine-a".into())
-            .spawn(move || {
-                if let Err(err) = e.run() {
-                    error!("engine A stopped: {err:#}");
-                }
-            })
-            .expect("spawn engine A thread")
-    });
-
-    // Engine B
-    if let (Some(l), true) = (transparent, engine.is_some()) {
-        tokio::spawn(tg_bridge::serve_transparent(l, ctx.clone()));
-        info!("Telegram Desktop is redirected transparently, no proxy settings needed");
-        let n = nat.clone();
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                iv.tick().await;
-                let removed = n.gc();
-                if removed > 0 {
-                    tracing::debug!("NAT: {removed} expired, {} active", n.len());
-                }
-            }
-        });
-    }
-    tokio::spawn(log_err("SOCKS5", tg_bridge::serve_socks(ctx.clone())));
-    tokio::spawn(log_err("MTProxy", tg_bridge::serve_mtproxy(ctx.clone())));
-    info!("manual fallback: SOCKS5 {} or {}", tg_bridge::SOCKS_ADDR, tg_bridge::proxy_link(&ctx.secret));
-
-    // Engine C
-    tokio::spawn(prober::run(shared.clone(), ctx.clone(), engine.is_some()));
+    tokio::spawn(prober::run(shared.clone()));
 
     tokio::signal::ctrl_c().await?;
     info!("shutting down");
-    if let Some(e) = &engine {
-        e.shutdown();
-    }
-    if let Some(t) = a_thread {
-        let _ = t.join();
-    }
+    engine.shutdown();
+    let _ = a_thread.join();
     Ok(())
-}
-
-#[cfg(windows)]
-async fn log_err(what: &'static str, f: impl std::future::Future<Output = anyhow::Result<()>>) {
-    if let Err(e) = f.await {
-        tracing::error!("{what}: {e:#}");
-    }
 }
 
 #[cfg(windows)]
@@ -255,42 +171,6 @@ mod win {
             Ok(())
         } else {
             Err(std::io::Error::last_os_error())
-        }
-    }
-
-    const FW_RULE: &str = "dpi-bypass Telegram bridge";
-
-    /// (Re)creates an inbound allow rule for this exe on the bridge port.
-    pub fn allow_bridge_port(port: u16) -> std::io::Result<()> {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let exe = std::env::current_exe()?;
-        let netsh = |args: &[String]| {
-            Command::new("netsh")
-                .args(["advfirewall", "firewall"])
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
-                .status()
-        };
-        let _ = netsh(&["delete".into(), "rule".into(), format!("name={FW_RULE}")]);
-        let st = netsh(&[
-            "add".into(),
-            "rule".into(),
-            format!("name={FW_RULE}"),
-            "dir=in".into(),
-            "action=allow".into(),
-            "protocol=TCP".into(),
-            format!("localport={port}"),
-            format!("program={}", exe.display()),
-            "enable=yes".into(),
-        ])?;
-        if st.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!("netsh exited with {st}")))
         }
     }
 
