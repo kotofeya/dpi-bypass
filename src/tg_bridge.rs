@@ -174,11 +174,12 @@ impl Ctx {
                 }
                 Err(e) => {
                     self.gateways.record_fail(&h);
-                    warn!("ws {h}: {e:#}");
-                    last = e;
+                    debug!("ws {h}: {e:#}");
+                    last = anyhow!("{h}: {e:#}");
                 }
             }
         }
+        warn!("DC{dc}{}: no WebSocket gateway reachable, last error: {last:#}", if media { " (media)" } else { "" });
         self.failed();
         Err(last)
     }

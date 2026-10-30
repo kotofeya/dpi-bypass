@@ -20,15 +20,27 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let arg_value = |args: &[String], name: &str| {
+        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    };
+
+    // Log filter: --log <filter>, -v / --verbose (= debug), else RUST_LOG, else info.
+    // The UAC relaunch does not inherit environment variables, so RUST_LOG is forwarded as --log.
+    let filter = arg_value(&args, "--log")
+        .or_else(|| args.iter().any(|a| a == "-v" || a == "--verbose").then(|| "debug".to_string()))
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| "info".to_string());
+    let ansi = win::enable_ansi();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(ansi)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&filter).unwrap_or_else(|_| "info".into()))
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "dpi-bypass [--no-elevate] [--bridge-port N]\n\n\
-             Runs elevated (relaunches itself via UAC). RUST_LOG=debug for packet-level logs.\n\
+            "dpi-bypass [-v | --log <filter>] [--no-elevate] [--bridge-port N]\n\n\
+             Runs elevated (relaunches itself via UAC). -v shows packet-level debug logs.\n\
              Without Administrator rights only the SOCKS5 ({}) and MTProxy ({}) fallbacks run.",
             tg_bridge::SOCKS_ADDR,
             tg_bridge::MTP_ADDR
@@ -38,6 +50,10 @@ fn main() -> anyhow::Result<()> {
 
     let elevated = win::is_elevated();
     if !elevated && !args.iter().any(|a| a == "--no-elevate") {
+        if arg_value(&args, "--log").is_none() {
+            args.push("--log".into());
+            args.push(filter.clone());
+        }
         match win::relaunch_elevated(&args) {
             Ok(()) => {
                 tracing::info!("relaunched elevated, exiting this instance");
@@ -167,6 +183,23 @@ mod win {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    /// Turns on VT escape processing so log colours render in old consoles (Windows
+    /// PowerShell 5 / conhost). Returns false when colours should be disabled instead.
+    pub fn enable_ansi() -> bool {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0u32;
+            if h.is_null() || GetConsoleMode(h, &mut mode) == 0 {
+                return false; // redirected to a file/pipe: plain text
+            }
+            mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+                || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+        }
+    }
 
     /// Is this process running with an elevated (Administrator) token?
     pub fn is_elevated() -> bool {

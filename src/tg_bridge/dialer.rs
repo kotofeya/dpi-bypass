@@ -151,6 +151,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FragIo<S> {
     }
 }
 
+const STAGE_TIMEOUT: Duration = Duration::from_secs(4);
+
 pub type Tls = tokio_rustls::client::TlsStream<FragIo<TcpStream>>;
 pub type Ws = WebSocketStream<Tls>;
 
@@ -204,32 +206,42 @@ impl WsDialer {
             }
             let ips = self.resolve(host, doh).await;
             for ip in ips.iter().take(4) {
-                match timeout(Duration::from_secs(6), self.connect_ip(host, *ip)).await {
-                    Ok(Ok(ws)) => return Ok(ws),
-                    Ok(Err(e)) => last = e,
-                    Err(_) => last = anyhow!("timeout via {ip}"),
+                match self.connect_ip(host, *ip).await {
+                    Ok(ws) => return Ok(ws),
+                    Err(e) => last = e,
                 }
             }
         }
         Err(last)
     }
 
+    /// TCP, TLS and the WebSocket upgrade each get their own timeout, so a failure says which
+    /// layer is blocked: TCP = the address is blackholed, TLS = SNI/handshake filtering.
     async fn connect_ip(&self, host: &str, ip: IpAddr) -> Result<Ws> {
         let p = self.profile.load_full();
-        let (tcp, guard) = connect_bypassed(&self.nat, SocketAddr::new(ip, 443)).await?;
+        let (tcp, guard) = timeout(STAGE_TIMEOUT, connect_bypassed(&self.nat, SocketAddr::new(ip, 443)))
+            .await
+            .map_err(|_| anyhow!("{ip}: TCP connect timed out (address blocked?)"))?
+            .map_err(|e| anyhow!("{ip}: TCP connect failed: {e}"))?;
         let plan = (p.ws_method == WsMethod::Fragment).then(|| Plan {
             split: p.ws_split,
             record_split: p.ws_record_split,
             delay: Duration::from_millis(p.ws_delay_ms),
         });
         let cfg = if p.ws_method == WsMethod::NoSni { &self.cfg_nosni } else { &self.cfg_sni };
-        let tls = TlsConnector::from(cfg.clone())
-            .connect(ServerName::try_from(host.to_string())?, FragIo::new(tcp, plan, Some(guard)))
-            .await?;
+        let hs = TlsConnector::from(cfg.clone())
+            .connect(ServerName::try_from(host.to_string())?, FragIo::new(tcp, plan, Some(guard)));
+        let tls = timeout(STAGE_TIMEOUT, hs)
+            .await
+            .map_err(|_| anyhow!("{ip}: TLS handshake timed out (ws_method={:?})", p.ws_method))?
+            .map_err(|e| anyhow!("{ip}: TLS handshake failed: {e}"))?;
         let mut req = format!("wss://{host}/apiws").into_client_request()?;
         req.headers_mut().insert("Sec-WebSocket-Protocol", HeaderValue::from_static("binary"));
         req.headers_mut().insert("Origin", HeaderValue::from_static("https://web.telegram.org"));
-        let (ws, _) = tokio_tungstenite::client_async(req, tls).await?;
+        let (ws, _) = timeout(STAGE_TIMEOUT, tokio_tungstenite::client_async(req, tls))
+            .await
+            .map_err(|_| anyhow!("{ip}: WebSocket upgrade timed out"))?
+            .map_err(|e| anyhow!("{ip}: WebSocket upgrade failed: {e}"))?;
         Ok(ws)
     }
 
