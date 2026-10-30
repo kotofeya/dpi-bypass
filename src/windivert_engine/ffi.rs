@@ -50,7 +50,11 @@ impl Address {
     }
 }
 
-// Linked by build.rs (WinDivert.lib, delay-loaded).
+// Linked by build.rs (WinDivert.lib, delay-loaded). On MSVC the functions must also be
+// declared dllimport (`kind = "dylib"`), otherwise calls go through the import library's
+// jump thunks and link.exe can drop /DELAYLOAD with LNK4199. The GNU build links its own
+// delay-import library from build.rs instead.
+#[cfg_attr(target_env = "msvc", link(name = "WinDivert", kind = "dylib"))]
 extern "C" {
     fn WinDivertOpen(filter: *const c_char, layer: i32, priority: i16, flags: u64) -> *mut c_void;
     fn WinDivertRecv(h: *mut c_void, pkt: *mut c_void, len: u32, recv_len: *mut u32, addr: *mut Address) -> i32;
