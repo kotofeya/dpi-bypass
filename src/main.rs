@@ -37,7 +37,10 @@ fn main() -> anyhow::Result<()> {
     }
     if args.iter().any(|a| a == "--install" || a == "--uninstall") {
         // runs from an Administrator console so the result stays on screen
-        if !win::is_elevated() {
+        // release builds abort on panic; make sure the reason reaches the log first
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
+
+    if !win::is_elevated() {
             anyhow::bail!("run this from an Administrator PowerShell (right-click PowerShell -> Run as administrator)");
         }
         return if args.iter().any(|a| a == "--install") { win::install_task() } else { win::uninstall_task() };
@@ -95,8 +98,15 @@ async fn run() -> anyhow::Result<()> {
     let a_thread = {
         let e = engine.clone();
         std::thread::Builder::new().name("engine-a".into()).spawn(move || {
-            if let Err(err) = e.run() {
-                tracing::error!("engine A stopped: {err:#}");
+            let res = e.run();
+            if !e.stopping() {
+                // the packet loop is the whole program: without it nothing is being fixed, so
+                // exit non-zero and let Task Scheduler start a fresh copy
+                match res {
+                    Err(err) => tracing::error!("engine A stopped: {err:#}"),
+                    Ok(()) => tracing::error!("engine A stopped unexpectedly"),
+                }
+                std::process::exit(1);
             }
         })?
     };

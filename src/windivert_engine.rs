@@ -70,17 +70,34 @@ mod imp {
             self.dv.shutdown();
         }
 
+        /// True once `shutdown` was requested, i.e. `run` returning is expected.
+        pub fn stopping(&self) -> bool {
+            self.dv.is_closed()
+        }
+
         pub fn run(&self) -> Result<()> {
             let mut buf = vec![0u8; 65535];
+            let mut errors = 0u32;
             tracing::info!("engine A: packet loop running");
             loop {
                 let (n, addr) = match self.dv.recv(&mut buf) {
-                    Ok(v) => v,
+                    Ok(v) => {
+                        errors = 0;
+                        v
+                    }
                     Err(e) => {
                         if self.dv.is_closed() {
                             return Ok(());
                         }
-                        tracing::warn!("WinDivertRecv: {e}");
+                        errors += 1;
+                        if errors <= 3 {
+                            tracing::warn!("WinDivertRecv: {e}");
+                        }
+                        if errors >= 100 {
+                            // the handle is dead (driver reset, adapter change): let the caller
+                            // restart the whole process, which reopens the driver
+                            anyhow::bail!("WinDivertRecv keeps failing: {e}");
+                        }
                         std::thread::sleep(Duration::from_millis(20));
                         continue;
                     }

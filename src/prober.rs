@@ -117,8 +117,9 @@ fn candidates(base: &Profile) -> Vec<Profile> {
 /// on the normal schedule).
 async fn search(shared: &Shared) -> bool {
     let need = HTTPS_TARGETS.len();
+    let original = shared.load_full();
     let mut best: Option<(usize, Duration, Vec<bool>, Profile)> = None;
-    for cand in candidates(&shared.load_full()) {
+    for cand in candidates(&original) {
         shared.store(Arc::new(cand.clone()));
         let (oks, total) = probe_all().await;
         let ok = oks.iter().filter(|o| **o).count();
@@ -148,7 +149,10 @@ async fn search(shared: &Shared) -> bool {
             true
         }
         None => {
-            warn!("no strategy reached any target, keeping the current profile");
+            // the loop left the last (probably worst) candidate in place: put the old one back,
+            // e.g. after a network blip it is still the best guess
+            shared.store(original);
+            warn!("no strategy reached any target (network down?), keeping the previous profile");
             false
         }
     }
